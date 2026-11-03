@@ -8,6 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from app.config import settings
 from app.database import init_db, get_connection
 from app.services.downloader import DownloaderService
+from app.services.nse_client import NSEExtranetClient, NSEAPIError
 
 BASE_DIR = Path(__file__).resolve().parent
 downloader = DownloaderService()
@@ -74,3 +75,27 @@ def start_download(payload: dict):
     except NotImplementedError as exc:
         raise HTTPException(status_code=501, detail=str(exc))
     return result
+
+
+@app.post("/api/nse/list")
+def nse_list(payload: dict):
+    segment = str(payload.get("segment", "CM")).upper()
+    folder_path = str(payload.get("folder_path", "/")).strip() or "/"
+    if segment != "CM":
+        raise HTTPException(status_code=400, detail="Initial LIVE integration is restricted to CM.")
+    if not folder_path.startswith("/") or "\\" in folder_path or ".." in folder_path.split("/"):
+        raise HTTPException(status_code=400, detail="folder_path must be an absolute NSE path using forward slashes.")
+    try:
+        with NSEExtranetClient() as client:
+            result = client.list_content(segment=segment, folder_path=folder_path)
+        return {
+            "segment": segment,
+            "folder_path": folder_path,
+            "response_code": result.get("responseCode"),
+            "response_description": result.get("responseDesc") or result.get("reponseDesc"),
+            "items": result.get("data", []),
+        }
+    except NSEAPIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc

@@ -10,38 +10,50 @@
   <main class="shell">
     <header class="top">
       <div>
-        <p class="eyebrow">LOCAL CONTROL PANEL · V0.1.0</p>
+        <p class="eyebrow">LOCAL CONTROL PANEL · V0.2.0</p>
         <h1>NSE Extranet Downloader</h1>
-        <p class="muted">Segment-wise file collection and download history.</p>
+        <p class="muted">LIVE API connection test and segment-wise file collection.</p>
       </div>
       <span class="status"><i></i> Application running</span>
     </header>
 
     <section class="notice">
-      <strong>Integration status: not connected</strong>
-      <p>The dashboard and local database are ready. Live NSE downloads remain disabled until the complete API specification is reviewed and implemented.</p>
+      <strong>LIVE integration · read-only listing stage</strong>
+      <p>This stage authenticates with NSE and reads folder contents only. It does not download or modify exchange files.</p>
     </section>
 
     <section class="grid">
       <article class="panel">
-        <h2>Start a segment download</h2>
-        <p class="muted">Choose a segment. This control will be enabled after UAT integration is validated.</p>
+        <h2>Browse NSE folders</h2>
+        <p class="muted">Start with the CM segment root. You can enter a folder path after checking the root listing.</p>
         <label for="segment">Segment</label>
-        <select id="segment">
-          <option>CM</option><option>FO</option><option>CD</option>
-          <option>CO</option><option>SLB</option><option>DEBT</option>
-        </select>
-        <button id="start" disabled title="NSE API integration is not configured">Start download (coming next)</button>
-        <p id="message" class="muted small">No NSE requests will be sent by this version.</p>
+        <select id="segment"><option>CM</option></select>
+        <label for="folderPath">Folder path</label>
+        <input id="folderPath" type="text" value="/" autocomplete="off" spellcheck="false">
+        <button id="listFolders">Connect and list folder</button>
+        <p id="message" class="muted small">Credentials are read from your local .env file.</p>
       </article>
 
       <article class="panel">
-        <h2>Project status</h2>
-        <div class="metric"><span>Backend</span><b class="good">Running</b></div>
-        <div class="metric"><span>Database</span><b>SQLite</b></div>
-        <div class="metric"><span>Download engine</span><b>Awaiting API specification</b></div>
-        <div class="metric"><span>Scheduler</span><b>Not configured</b></div>
+        <h2>Connection settings</h2>
+        <div class="metric"><span>Environment</span><b>LIVE</b></div>
+        <div class="metric"><span>API version</span><b>2.0</b></div>
+        <div class="metric"><span>Authentication</span><b>On demand</b></div>
+        <div class="metric"><span>Download engine</span><b>Not enabled</b></div>
+        <p class="muted small">NSE allows one active login per API user. This app logs out after each listing request.</p>
       </article>
+    </section>
+
+    <section class="panel">
+      <div class="section-head">
+        <div><h2>Folder contents</h2><p class="muted" id="listingCaption">No folder has been queried yet.</p></div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Type</th><th>Name</th><th>Parent path</th><th>Last updated</th></tr></thead>
+          <tbody id="folderItems"><tr><td colspan="4" class="muted">No listing data.</td></tr></tbody>
+        </table>
+      </div>
     </section>
 
     <section class="panel">
@@ -56,7 +68,7 @@
         </table>
       </div>
     </section>
-    <footer>Local development build · NSE API integration pending</footer>
+    <footer>Local development build · LIVE folder listing only</footer>
   </main>
   <script src="/static/app.js"></script>
 </body>
