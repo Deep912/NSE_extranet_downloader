@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NSE Extranet Downloader</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="top">
+      <div>
+        <p class="eyebrow">LOCAL CONTROL PANEL · V0.1.0</p>
+        <h1>NSE Extranet Downloader</h1>
+        <p class="muted">Segment-wise file collection and download history.</p>
+      </div>
+      <span class="status"><i></i> Application running</span>
+    </header>
+
+    <section class="notice">
+      <strong>Integration status: not connected</strong>
+      <p>The dashboard and local database are ready. Live NSE downloads remain disabled until the complete API specification is reviewed and implemented.</p>
+    </section>
+
+    <section class="grid">
+      <article class="panel">
+        <h2>Start a segment download</h2>
+        <p class="muted">Choose a segment. This control will be enabled after UAT integration is validated.</p>
+        <label for="segment">Segment</label>
+        <select id="segment">
+          <option>CM</option><option>FO</option><option>CD</option>
+          <option>CO</option><option>SLB</option><option>DEBT</option>
+        </select>
+        <button id="start" disabled title="NSE API integration is not configured">Start download (coming next)</button>
+        <p id="message" class="muted small">No NSE requests will be sent by this version.</p>
+      </article>
+
+      <article class="panel">
+        <h2>Project status</h2>
+        <div class="metric"><span>Backend</span><b class="good">Running</b></div>
+        <div class="metric"><span>Database</span><b>SQLite</b></div>
+        <div class="metric"><span>Download engine</span><b>Awaiting API specification</b></div>
+        <div class="metric"><span>Scheduler</span><b>Not configured</b></div>
+      </article>
+    </section>
+
+    <section class="panel">
+      <div class="section-head">
+        <div><h2>Recent download history</h2><p class="muted">Files recorded by the application.</p></div>
+        <button class="secondary" id="refresh">Refresh</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Segment</th><th>Exchange date</th><th>File</th><th>Status</th><th>Downloaded at</th></tr></thead>
+          <tbody id="downloads"><tr><td colspan="5" class="muted">No download records yet.</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+    <footer>Local development build · NSE API integration pending</footer>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
