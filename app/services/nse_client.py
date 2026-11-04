@@ -340,19 +340,22 @@ class NSEExtranetClient:
 
         return response
 
+    
     def list_all_content(
         self,
         segment: str,
         root_path: str = "/",
         max_folders: int = 1000,
     ) -> dict:
-        """Recursively scan folders, retaining progress when a folder fails."""
+        """Recursively scan folders and display progress."""
 
         pending = [(root_path, 0)]
         visited = set()
         all_items = []
         failed_folders = []
         folders_scanned = 0
+
+        print(f"[NSE] Starting recursive scan: {segment}", flush=True)
 
         while pending:
             current_path, depth = pending.pop()
@@ -361,6 +364,10 @@ class NSEExtranetClient:
                 continue
 
             if folders_scanned >= max_folders:
+                print(
+                    f"[NSE] Maximum folder limit reached: {max_folders}",
+                    flush=True,
+                )
                 break
 
             if depth > 20:
@@ -373,20 +380,39 @@ class NSEExtranetClient:
             visited.add(current_path)
             folders_scanned += 1
 
+            print(
+                f"[NSE] Scanning {current_path} "
+                f"({folders_scanned}/{max_folders})",
+                flush=True,
+            )
+
             try:
                 result = self.list_content(
                     segment=segment,
                     folder_path=current_path,
                 )
 
+                items = result.get("data", [])
+
+                print(
+                    f"[NSE] Completed {current_path} "
+                    f"— {len(items)} items found",
+                    flush=True,
+                )
+
             except NSEAPIError as exc:
+                print(
+                    f"[NSE] ERROR in {current_path}: {exc}",
+                    flush=True,
+                )
+
                 failed_folders.append({
                     "folder": current_path,
                     "error": str(exc),
                 })
                 continue
 
-            for item in result.get("data", []):
+            for item in items:
                 if not isinstance(item, dict):
                     continue
 
@@ -419,6 +445,18 @@ class NSEExtranetClient:
             if str(item.get("type", "")).lower() == "folder"
         ]
 
+        scan_complete = (
+            len(failed_folders) == 0
+            and len(pending) == 0
+            and folders_scanned < max_folders
+        )
+
+        print(
+            f"[NSE] Scan finished: {folders_scanned} folders, "
+            f"{len(files)} files, {len(failed_folders)} errors",
+            flush=True,
+        )
+
         return {
             "segment": segment,
             "root_path": root_path,
@@ -427,7 +465,7 @@ class NSEExtranetClient:
             "files": files,
             "folders": folders,
             "failed_folders": failed_folders,
-            "scan_complete": len(failed_folders) == 0 and len(pending) == 0,
+            "scan_complete": scan_complete,
         }
 
     def close(self) -> None:

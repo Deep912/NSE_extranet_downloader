@@ -14,7 +14,7 @@ from app.services.nse_client import NSEExtranetClient, NSEAPIError
 BASE_DIR = Path(__file__).resolve().parent
 downloader = DownloaderService()
 
-SUPPORTED_SEGMENTS = {"CM", "FO", "CD", "CO", "SLB", "DEBT"}
+SUPPORTED_SEGMENTS = {"CM", "FO", "CD", "CO", "SLB"}
 
 
 @asynccontextmanager
@@ -37,14 +37,15 @@ app.mount(
 )
 
 
+
 def validate_folder_request(payload: dict):
-    segment = str(payload.get("segment", "CM")).upper()
+    segment = str(payload.get("segment", "CM")).upper().strip()
     folder_path = str(payload.get("folder_path", "/")).strip() or "/"
 
-    if segment != "CM":
+    if segment not in SUPPORTED_SEGMENTS:
         raise HTTPException(
             status_code=400,
-            detail="Initial LIVE integration is restricted to CM.",
+            detail=f"Unsupported segment: {segment}",
         )
 
     if (
@@ -54,10 +55,14 @@ def validate_folder_request(payload: dict):
     ):
         raise HTTPException(
             status_code=400,
-            detail="folder_path must be an absolute NSE path using forward slashes.",
+            detail=(
+                "folder_path must be an absolute NSE path "
+                "using forward slashes."
+            ),
         )
 
     return segment, folder_path
+
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -241,4 +246,46 @@ def nse_download_folder(payload: dict):
         raise HTTPException(
             status_code=500,
             detail=f"Could not save the downloaded file: {exc}",
+        ) from exc
+
+
+
+@app.post("/api/nse/download-segments")
+def nse_download_segments(payload: dict):
+    """
+    Scan and download all accessible folders
+    from the selected NSE segments.
+    """
+
+    segments = payload.get("segments", [])
+    date = str(payload.get("date", "")).strip()
+
+    if not isinstance(segments, list) or not segments:
+        raise HTTPException(
+            status_code=400,
+            detail="Select at least one segment.",
+        )
+
+    if not date:
+        raise HTTPException(
+            status_code=400,
+            detail="date is required in DD-MM-YYYY format.",
+        )
+
+    try:
+        return downloader.download_segments(
+            segments=segments,
+            date=date,
+        )
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+    except NSEAPIError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=str(exc),
         ) from exc
