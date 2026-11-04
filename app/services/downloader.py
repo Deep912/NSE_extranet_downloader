@@ -18,6 +18,28 @@ class DownloaderService:
 
     def __init__(self, download_root: Path = DOWNLOAD_ROOT):
         self.download_root = Path(download_root)
+    
+    @staticmethod
+    def _validate_folder_path(folder_path: str) -> str:
+        """Validate and normalise an NSE folder path."""
+
+        if not folder_path:
+            raise ValueError("Folder path cannot be empty.")
+
+        if "\\" in folder_path:
+            raise ValueError(
+                "Folder path must use forward slashes."
+            )
+
+        if ".." in folder_path.split("/"):
+            raise ValueError(
+                "Folder path cannot contain '..'."
+            )
+
+        # Convert /Reports into Reports/
+        normalised_path = folder_path.strip("/") + "/"
+
+        return normalised_path
 
     @staticmethod
     def _validate_date(date: str) -> str:
@@ -53,15 +75,7 @@ class DownloaderService:
         segment = segment.upper().strip()
         date = self._validate_date(date)
 
-        if not folder_path or "\\" in folder_path:
-            raise ValueError("Invalid NSE folder path.")
-
-        if ".." in folder_path.split("/"):
-            raise ValueError("Invalid NSE folder path.")
-
-        # NSE listing returned paths such as Reports/.
-        # Preserve that convention for the download API.
-        folder_path = folder_path.strip("/") + "/"
+        folder_path = self._validate_folder_path(folder_path)
 
         date_for_filename = date.replace("-", "")
         folder_name = self._safe_folder_name(folder_path)
