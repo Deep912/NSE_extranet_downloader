@@ -1,6 +1,7 @@
 
 from contextlib import asynccontextmanager
 from pathlib import Path
+from app.services.folder_catalogue_service import FolderCatalogueService
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
@@ -13,6 +14,8 @@ from app.services.nse_client import NSEExtranetClient, NSEAPIError
 
 BASE_DIR = Path(__file__).resolve().parent
 downloader = DownloaderService()
+
+catalogue_service = FolderCatalogueService()
 
 SUPPORTED_SEGMENTS = {"CM", "FO", "CD", "CO", "SLB"}
 
@@ -208,6 +211,82 @@ def nse_scan(payload: dict):
             status_code=500,
             detail=str(exc),
         ) from exc
+
+
+@app.post("/api/nse/scan-catalogue")
+def scan_nse_catalogue(
+    segment: str = "CM",
+):
+    """
+    Scan NSE folders and save the discovered
+    folder and file structure into SQLite.
+    """
+
+    segment = segment.strip().upper()
+
+    if segment not in SUPPORTED_SEGMENTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported segment: {segment}",
+        )
+
+    try:
+        print(
+            f"[NSE] Starting catalogue scan: {segment}",
+            flush=True,
+        )
+
+        # Authenticate and scan NSE.
+        with NSEExtranetClient() as client:
+
+            scan_result = client.list_all_content(
+                segment=segment,
+                root_path="/",
+            )
+
+        # Save the scan results into SQLite.
+        saved_result = catalogue_service.save_scan_result(
+            segment=segment,
+            scan_result=scan_result,
+            service="member",
+        )
+
+        print(
+            f"[NSE] Catalogue saved: "
+            f"{saved_result['folders_saved']} folders, "
+            f"{saved_result['files_saved']} files",
+            flush=True,
+        )
+
+        return {
+            "success": True,
+            "message": "NSE catalogue scan completed",
+            "scan": {
+                **saved_result,
+                "folders_scanned": scan_result["folders_scanned"],
+                "total_items": scan_result["total_items"],
+                "scan_complete": scan_result["scan_complete"],
+            },
+        }
+
+    except NSEAPIError as exc:
+        print(f"[NSE] API error: {exc}", flush=True)
+
+        raise HTTPException(
+            status_code=502,
+            detail=f"NSE API error: {exc}",
+        )
+
+    except Exception as exc:
+        print(
+            f"[NSE] Catalogue scan failed: {exc}",
+            flush=True,
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Catalogue scan failed. Check application logs.",
+        )
 
 @app.post("/api/nse/download-folder")
 def nse_download_folder(payload: dict):

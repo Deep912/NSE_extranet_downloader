@@ -1,6 +1,6 @@
 
 import posixpath
-
+import time
 import httpx
 
 from app.config import settings
@@ -140,47 +140,76 @@ class NSEExtranetClient:
         if not self._token:
             self.login()
 
-    def list_content(
-        self,
-        segment: str,
-        folder_path: str = "/",
-    ) -> dict:
-        """Retrieve one level of folder contents from NSE."""
+    
+    def list_content(self, segment: str, folder_path: str = "/") -> dict:
+        """
+        List files and folders inside an NSE Extranet directory.
+
+        Retries the request once if NSE interrupts the response connection.
+        """
 
         self._ensure_authenticated()
 
-        try:
-            response = self._http.get(
-                f"member/content/{self.version}",
-                params={
-                    "segment": segment,
-                    "folderPath": folder_path,
-                },
-                headers={
-                    "Authorization": f"Bearer {self._token}",
-                },
-            )
-        except httpx.TimeoutException as exc:
-            raise NSEAPIError(
-                f"NSE timed out while listing folder: {folder_path}"
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise NSEAPIError(
-                f"NSE folder listing request failed for {folder_path}: "
-                f"{type(exc).__name__}"
-            ) from exc
+        endpoint = f"member/content/{self.version}"
+        params = {
+            "segment": segment,
+            "folderPath": folder_path,
+        }
+        headers = {
+            "Authorization": f"Bearer {self._token}",
+        }
 
+        # Attempt the GET request up to two times.
+        for attempt in range(2):
+            try:
+                response = self._http.get(
+                    endpoint,
+                    params=params,
+                    headers=headers,
+                )
+                break
+
+            except httpx.TimeoutException as exc:
+                raise NSEAPIError(
+                    f"NSE timed out while listing folder: {folder_path}"
+                ) from exc
+
+            except httpx.ReadError as exc:
+                if attempt == 0:
+                    print(
+                        f"[NSE] Connection interrupted for {folder_path}. "
+                        "Retrying once in 1 second...",
+                        flush=True,
+                    )
+                    time.sleep(1)
+                    continue
+
+                raise NSEAPIError(
+                    f"NSE response read failed for {folder_path} "
+                    f"after 2 attempts: {type(exc).__name__}: {exc!r}"
+                ) from exc
+
+            except httpx.HTTPError as exc:
+                raise NSEAPIError(
+                    f"NSE folder listing request failed for {folder_path}: "
+                    f"{type(exc).__name__}: {exc!r}"
+                ) from exc
+
+        # Parse the response.
         payload = self._response_json(response)
 
+        # Check HTTP status.
         if response.is_error:
             raise NSEAPIError(
-                f"NSE folder listing HTTP error {response.status_code}: "
-                f"{payload.get('responseDesc', payload.get('status', 'Request rejected'))}"
+                f"NSE folder listing failed for {folder_path}: "
+                f"HTTP {response.status_code} - {payload}"
             )
 
+        # Check NSE API success code.
         self._check_api_success(payload, "folder listing")
 
         return payload
+
 
     
     def download_single_file(
