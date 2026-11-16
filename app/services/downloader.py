@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from app.services.nse_client import NSEExtranetClient, NSEAPIError
+from app.services.folder_catalogue_service import FolderCatalogueService
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -17,10 +18,17 @@ SUPPORTED_SEGMENTS = {"CM", "FO", "CD", "CO", "SLB"}
 
 
 class DownloaderService:
-    """Coordinates multi-segment NSE bulk downloads."""
+    """Coordinates catalogue-based NSE bulk downloads."""
 
-    def __init__(self, download_root: Path = DOWNLOAD_ROOT):
+    def __init__(
+        self,
+        download_root: Path = DOWNLOAD_ROOT,
+        catalogue_service=None,
+    ):
         self.download_root = Path(download_root)
+        self.catalogue_service = (
+            catalogue_service or FolderCatalogueService()
+        )
 
     @staticmethod
     def _validate_date(date: str) -> str:
@@ -38,18 +46,13 @@ class DownloaderService:
 
     @staticmethod
     def _validate_folder_path(folder_path: str) -> str:
-        if not folder_path:
+        if not isinstance(folder_path, str) or not folder_path.strip():
             raise ValueError("Folder path cannot be empty.")
 
-        if "\\" in folder_path:
-            raise ValueError(
-                "Folder path must use forward slashes."
-            )
+        folder_path = folder_path.strip().replace("\\", "/")
 
         if ".." in folder_path.split("/"):
-            raise ValueError(
-                "Folder path cannot contain '..'."
-            )
+            raise ValueError("Folder path cannot contain '..'.")
 
         return folder_path.strip("/") + "/"
 
@@ -75,10 +78,26 @@ class DownloaderService:
         if not archive_bytes:
             raise NSEAPIError("NSE returned an empty archive.")
 
-        if not zipfile.is_zipfile(io.BytesIO(archive_bytes)):
+        archive_stream = io.BytesIO(archive_bytes)
+
+        if not zipfile.is_zipfile(archive_stream):
             raise NSEAPIError(
                 "NSE response is not a valid ZIP archive."
             )
+
+        # Verify that the ZIP contents can actually be read.
+        archive_stream.seek(0)
+
+        try:
+            with zipfile.ZipFile(archive_stream) as archive:
+                bad_file = archive.testzip()
+
+                if bad_file is not None:
+                    raise NSEAPIError(
+                        f"ZIP integrity check failed: {bad_file}"
+                    )
+        except zipfile.BadZipFile as exc:
+            raise NSEAPIError("NSE returned a corrupted ZIP.") from exc
 
         date_for_filename = date.replace("-", "")
         folder_name = self._safe_folder_name(folder_path)
@@ -98,10 +117,8 @@ class DownloaderService:
         )
 
         archive_hash = self._sha256(archive_bytes)
-
         archive_path = destination_dir / f"{base_name}.zip"
 
-        # Skip an identical archive already downloaded.
         if archive_path.exists():
             existing_hash = self._sha256(
                 archive_path.read_bytes()
@@ -118,7 +135,6 @@ class DownloaderService:
                     "sha256": archive_hash,
                 }
 
-            # Preserve both versions if the content changed.
             archive_path = destination_dir / (
                 f"{base_name}_{archive_hash[:8]}.zip"
             )
@@ -135,9 +151,7 @@ class DownloaderService:
                     "sha256": archive_hash,
                 }
 
-            raise NSEAPIError(
-                "Archive filename collision detected."
-            )
+            raise NSEAPIError("Archive filename collision detected.")
 
         temporary_path = archive_path.with_suffix(".zip.part")
 
@@ -188,32 +202,51 @@ class DownloaderService:
             archive_bytes=archive_bytes,
         )
 
+    def _get_cached_folders(self, segment: str) -> list:
+        """Get unique folder paths from the saved SQLite catalogue."""
+
+        files = self.catalogue_service.get_files(
+            segment=segment,
+            service="member",
+        )
+
+        folders = sorted({
+            self._validate_folder_path(item["folder_path"])
+            for item in files
+            if item.get("folder_path") is not None
+        })
+
+        if not folders:
+            raise ValueError(
+                f"No cached folders containing files were found for "
+                f"{segment}. Run a successful catalogue scan first."
+            )
+
+        return folders
+
     def download_segments(
         self,
         segments: list[str],
         date: str,
     ) -> dict:
         """
-        Scan and download all accessible folders containing files
-        across the selected NSE segments.
+        Download date-based ZIP archives using cached folder paths.
+
+        This method deliberately does not recursively scan NSE.
         """
 
         date = self._validate_date(date)
 
-        # Normalise and validate the selected segments.
-        selected_segments = list(
-            dict.fromkeys(
-                str(segment).upper().strip()
-                for segment in segments
-            )
-        )
+        selected_segments = list(dict.fromkeys(
+            str(segment).upper().strip()
+            for segment in segments
+        ))
 
         if not selected_segments:
             raise ValueError("Select at least one segment.")
 
         invalid_segments = [
-            segment
-            for segment in selected_segments
+            segment for segment in selected_segments
             if segment not in SUPPORTED_SEGMENTS
         ]
 
@@ -228,59 +261,30 @@ class DownloaderService:
         total_skipped = 0
         total_failed = 0
 
-        # Process segments sequentially.
         for segment in selected_segments:
-
             segment_result = {
                 "segment": segment,
                 "status": "started",
-                "folders_scanned": 0,
                 "folders_found": 0,
                 "downloaded": 0,
                 "skipped": 0,
                 "failed": 0,
-                "scan_failures": [],
                 "downloads": [],
             }
 
             try:
-                # One NSE login/session for this segment.
+                folders_to_download = self._get_cached_folders(segment)
+                segment_result["folders_found"] = len(
+                    folders_to_download
+                )
+
+                # One authenticated session for this segment.
                 with NSEExtranetClient() as client:
-
-                    print(f"[NSE] Scanning segment: {segment}")
-
-                    scan = client.list_all_content(
-                        segment=segment,
-                        root_path="/",
-                    )
-
-                    segment_result["folders_scanned"] = (
-                        scan["folders_scanned"]
-                    )
-
-                    segment_result["scan_failures"] = (
-                        scan["failed_folders"]
-                    )
-
-                    # Find unique folders containing files.
-                    folders_to_download = sorted({
-                        self._validate_folder_path(
-                            item["folderPath"]
-                        )
-                        for item in scan["files"]
-                        if item.get("folderPath")
-                    })
-
-                    segment_result["folders_found"] = len(
-                        folders_to_download
-                    )
-
-                    # Download one folder at a time.
                     for folder_path in folders_to_download:
-
                         print(
                             f"[NSE] Downloading "
-                            f"{segment}/{folder_path}"
+                            f"{segment}/{folder_path}",
+                            flush=True,
                         )
 
                         try:
@@ -317,14 +321,11 @@ class DownloaderService:
                                 "error": str(exc),
                             })
 
-                # Determine whether the segment completed fully.
-                if (
-                    segment_result["failed"] == 0
-                    and not segment_result["scan_failures"]
-                ):
-                    segment_result["status"] = "completed"
-                else:
-                    segment_result["status"] = "partial"
+                segment_result["status"] = (
+                    "completed"
+                    if segment_result["failed"] == 0
+                    else "partial"
+                )
 
             except Exception as exc:
                 segment_result["status"] = "failed"
