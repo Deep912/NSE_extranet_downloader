@@ -1,10 +1,8 @@
 
 import hashlib
-import io
 import re
-import zipfile
 
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
 
 from app.services.nse_client import NSEExtranetClient, NSEAPIError
@@ -16,148 +14,262 @@ DOWNLOAD_ROOT = PROJECT_ROOT / "data" / "downloads"
 
 SUPPORTED_SEGMENTS = {"CM", "FO", "CD", "CO", "SLB"}
 
+MAX_FOLDER_DEPTH = 20
+MAX_FOLDERS_PER_ROOT = 2000
+
 
 class DownloaderService:
-    """Coordinates catalogue-based NSE bulk downloads."""
+    """Coordinates recursive, date-filtered NSE file downloads."""
 
     def __init__(
         self,
         download_root: Path = DOWNLOAD_ROOT,
         catalogue_service=None,
+        client_factory=None,
     ):
         self.download_root = Path(download_root)
         self.catalogue_service = (
             catalogue_service or FolderCatalogueService()
         )
+        self.client_factory = client_factory or NSEExtranetClient
 
     @staticmethod
-    def _validate_date(date: str) -> str:
+    def _validate_date(exchange_date: str) -> str:
         try:
-            parsed = datetime.strptime(date, "%d-%m-%Y")
-        except ValueError as exc:
+            parsed = datetime.strptime(exchange_date, "%d-%m-%Y")
+        except (ValueError, TypeError) as exc:
             raise ValueError(
                 "Date must use DD-MM-YYYY format."
             ) from exc
 
-        if parsed.strftime("%d-%m-%Y") != date:
+        if parsed.strftime("%d-%m-%Y") != exchange_date:
             raise ValueError("Date must use DD-MM-YYYY format.")
 
-        return date
+        return exchange_date
+
+    @staticmethod
+    def _validate_segment(segment: str) -> str:
+        segment = str(segment).upper().strip()
+
+        if segment not in SUPPORTED_SEGMENTS:
+            raise ValueError(f"Unsupported segment: {segment}")
+
+        return segment
 
     @staticmethod
     def _validate_folder_path(folder_path: str) -> str:
         if not isinstance(folder_path, str) or not folder_path.strip():
             raise ValueError("Folder path cannot be empty.")
 
-        folder_path = folder_path.strip().replace("\\", "/")
+        folder_path = folder_path.strip()
 
-        if ".." in folder_path.split("/"):
-            raise ValueError("Folder path cannot contain '..'.")
+        if "\\" in folder_path:
+            raise ValueError(
+                "Folder path must use forward slashes only."
+            )
 
-        return folder_path.strip("/") + "/"
+        parts = folder_path.strip("/").split("/")
+
+        if any(part in {".", ".."} for part in parts):
+            raise ValueError("Invalid folder path.")
+
+        if not parts or parts == [""]:
+            return ""
+
+        return "/".join(parts) + "/"
+    @staticmethod
+    def _normalise_root_name(root_name: str) -> str:
+        """Accept one root folder name, not a nested path."""
+
+        if not isinstance(root_name, str) or not root_name.strip():
+            raise ValueError("Root folder name cannot be empty.")
+
+        root_name = root_name.strip()
+
+        if (
+            "/" in root_name
+            or "\\" in root_name
+            or root_name in {".", ".."}
+        ):
+            raise ValueError(
+                f"Invalid root folder name: {root_name}"
+            )
+
+        return root_name
 
     @staticmethod
-    def _safe_folder_name(folder_path: str) -> str:
-        name = folder_path.strip("/").replace("/", "_")
-        name = re.sub(r"[^A-Za-z0-9_.-]", "_", name)
-        return name or "root"
+    def _safe_component(value: str) -> str:
+        """Make a filename or folder name safe for Windows and Linux."""
+
+        value = str(value).strip()
+
+        value = re.sub(
+            r'[<>:"/\\|?*\x00-\x1f]',
+            "_",
+            value,
+        )
+
+        value = value.rstrip(". ")
+
+        if not value or value in {".", ".."}:
+            return "_"
+
+        return value
 
     @staticmethod
     def _sha256(data: bytes) -> str:
         return hashlib.sha256(data).hexdigest()
 
-    def _save_archive(
+    @staticmethod
+    def _get_file_date(item: dict) -> date | None:
+        """
+        Extract the file's NSE lastUpdated date.
+
+        NSE timestamps are documented as UTC. ISO timestamps containing
+        timezone information are converted to UTC before comparison.
+        """
+
+        value = item.get("lastUpdated")
+
+        if value is None:
+            return None
+
+        if not isinstance(value, str):
+            return None
+
+        value = value.strip()
+
+        if not value:
+            return None
+
+        # Handle ISO timestamps, including a trailing Z.
+        try:
+            parsed = datetime.fromisoformat(
+                value.replace("Z", "+00:00")
+            )
+
+            if parsed.tzinfo is not None:
+                from datetime import timezone
+
+                parsed = parsed.astimezone(timezone.utc)
+
+            return parsed.date()
+
+        except ValueError:
+            pass
+
+        # Handle a date without a time component.
+        for date_format in (
+            "%d-%m-%Y",
+            "%Y-%m-%d",
+        ):
+            try:
+                return datetime.strptime(
+                    value,
+                    date_format,
+                ).date()
+            except ValueError:
+                continue
+
+        return None
+
+    def _save_file(
         self,
         segment: str,
         folder_path: str,
-        date: str,
-        archive_bytes: bytes,
+        filename: str,
+        file_bytes: bytes,
+        exchange_date: str,
     ) -> dict:
-        """Validate and save the original NSE ZIP without extraction."""
+        """Save an individual NSE file without changing its contents."""
 
-        if not archive_bytes:
-            raise NSEAPIError("NSE returned an empty archive.")
-
-        archive_stream = io.BytesIO(archive_bytes)
-
-        if not zipfile.is_zipfile(archive_stream):
+        if not file_bytes:
             raise NSEAPIError(
-                "NSE response is not a valid ZIP archive."
+                f"NSE returned an empty file: {filename}"
             )
 
-        # Verify that the ZIP contents can actually be read.
-        archive_stream.seek(0)
+        date_for_folder = exchange_date.replace("-", "")
 
-        try:
-            with zipfile.ZipFile(archive_stream) as archive:
-                bad_file = archive.testzip()
+        safe_filename = self._safe_component(filename)
 
-                if bad_file is not None:
-                    raise NSEAPIError(
-                        f"ZIP integrity check failed: {bad_file}"
-                    )
-        except zipfile.BadZipFile as exc:
-            raise NSEAPIError("NSE returned a corrupted ZIP.") from exc
+        relative_folder = folder_path.strip("/")
 
-        date_for_filename = date.replace("-", "")
-        folder_name = self._safe_folder_name(folder_path)
+        safe_folder_parts = [
+            self._safe_component(part)
+            for part in relative_folder.split("/")
+            if part
+        ]
 
         destination_dir = (
-            self.download_root / segment / date_for_filename
-        )
-        destination_dir.mkdir(parents=True, exist_ok=True)
-
-        folder_hash = self._sha256(
-            folder_path.encode("utf-8")
-        )[:10]
-
-        base_name = (
-            f"{segment}_{date_for_filename}_"
-            f"{folder_name}_{folder_hash}"
+            self.download_root
+            / segment
+            / date_for_folder
         )
 
-        archive_hash = self._sha256(archive_bytes)
-        archive_path = destination_dir / f"{base_name}.zip"
+        for part in safe_folder_parts:
+            destination_dir = destination_dir / part
 
-        if archive_path.exists():
+        destination_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        destination_path = destination_dir / safe_filename
+
+        file_hash = self._sha256(file_bytes)
+
+        # If the exact file already exists, do not download it again.
+        if destination_path.exists():
             existing_hash = self._sha256(
-                archive_path.read_bytes()
+                destination_path.read_bytes()
             )
 
-            if existing_hash == archive_hash:
+            if existing_hash == file_hash:
                 return {
                     "status": "skipped",
                     "segment": segment,
                     "folder_path": folder_path,
-                    "file_name": archive_path.name,
-                    "file_path": str(archive_path),
-                    "file_size": archive_path.stat().st_size,
-                    "sha256": archive_hash,
+                    "file_name": safe_filename,
+                    "file_path": str(destination_path),
+                    "file_size": destination_path.stat().st_size,
+                    "sha256": file_hash,
                 }
 
-            archive_path = destination_dir / (
-                f"{base_name}_{archive_hash[:8]}.zip"
+            # Preserve the existing file if the new content differs.
+            destination_path = destination_dir / (
+                f"{destination_path.stem}_"
+                f"{file_hash[:8]}"
+                f"{destination_path.suffix}"
             )
 
-        if archive_path.exists():
-            if self._sha256(archive_path.read_bytes()) == archive_hash:
+        if destination_path.exists():
+            existing_hash = self._sha256(
+                destination_path.read_bytes()
+            )
+
+            if existing_hash == file_hash:
                 return {
                     "status": "skipped",
                     "segment": segment,
                     "folder_path": folder_path,
-                    "file_name": archive_path.name,
-                    "file_path": str(archive_path),
-                    "file_size": archive_path.stat().st_size,
-                    "sha256": archive_hash,
+                    "file_name": destination_path.name,
+                    "file_path": str(destination_path),
+                    "file_size": destination_path.stat().st_size,
+                    "sha256": file_hash,
                 }
 
-            raise NSEAPIError("Archive filename collision detected.")
+            raise NSEAPIError(
+                f"File collision detected: {destination_path.name}"
+            )
 
-        temporary_path = archive_path.with_suffix(".zip.part")
+        temporary_path = destination_path.with_name(
+            destination_path.name + ".part"
+        )
 
         try:
-            temporary_path.write_bytes(archive_bytes)
-            temporary_path.replace(archive_path)
+            temporary_path.write_bytes(file_bytes)
+            temporary_path.replace(destination_path)
+
         except OSError:
             temporary_path.unlink(missing_ok=True)
             raise
@@ -166,11 +278,317 @@ class DownloaderService:
             "status": "downloaded",
             "segment": segment,
             "folder_path": folder_path,
-            "file_name": archive_path.name,
-            "file_path": str(archive_path),
-            "file_size": archive_path.stat().st_size,
-            "sha256": archive_hash,
+            "file_name": destination_path.name,
+            "file_path": str(destination_path),
+            "file_size": destination_path.stat().st_size,
+            "sha256": file_hash,
         }
+
+    def _process_paths(
+        self,
+        segment: str,
+        selected_paths: list[tuple[str, str]],
+        exchange_date: str,
+    ) -> dict:
+        """
+        Recursively list selected folders and download matching files.
+
+        Each selected_paths entry contains:
+            (display_name, NSE folder path)
+        """
+
+        target_date = datetime.strptime(
+            exchange_date,
+            "%d-%m-%Y",
+        ).date()
+
+        result = {
+            "segment": segment,
+            "exchange_date": exchange_date,
+            "selected_roots": [
+                display_name
+                for display_name, _ in selected_paths
+            ],
+            "roots_processed": 0,
+            "folders_scanned": 0,
+            "folders_with_files": 0,
+            "total_files_seen": 0,
+            "matching_files": 0,
+            "downloaded": 0,
+            "skipped": 0,
+            "failed": 0,
+            "failed_folders": [],
+            "downloads": [],
+            "status": "started",
+        }
+
+        with self.client_factory() as client:
+
+            for display_name, root_path in selected_paths:
+                root_result = {
+                    "root": display_name,
+                    "folders_scanned": 0,
+                    "status": "started",
+                }
+
+                pending = [(root_path, 0)]
+                visited = set()
+
+                print(
+                    f"[NSE] Starting selected root: "
+                    f"{segment}/{root_path}",
+                    flush=True,
+                )
+
+                while pending:
+                    current_path, depth = pending.pop()
+
+                    if current_path in visited:
+                        continue
+
+                    if depth > MAX_FOLDER_DEPTH:
+                        error = "Maximum folder depth exceeded."
+
+                        result["failed"] += 1
+                        result["failed_folders"].append({
+                            "folder_path": current_path,
+                            "root": display_name,
+                            "error": error,
+                        })
+                        continue
+
+                    if (
+                        root_result["folders_scanned"]
+                        >= MAX_FOLDERS_PER_ROOT
+                    ):
+                        error = (
+                            "Maximum folder limit reached for root."
+                        )
+
+                        result["failed"] += 1
+                        result["failed_folders"].append({
+                            "folder_path": current_path,
+                            "root": display_name,
+                            "error": error,
+                        })
+                        break
+
+                    visited.add(current_path)
+
+                    root_result["folders_scanned"] += 1
+                    result["folders_scanned"] += 1
+
+                    print(
+                        f"[NSE] Listing {segment}/{current_path}",
+                        flush=True,
+                    )
+
+                    try:
+                        listing = client.list_content(
+                            segment=segment,
+                            folder_path=current_path,
+                        )
+
+                        items = listing.get("data", [])
+
+                        if not isinstance(items, list):
+                            raise NSEAPIError(
+                                "Unexpected NSE folder listing format."
+                            )
+
+                    except Exception as exc:
+                        result["failed"] += 1
+
+                        result["failed_folders"].append({
+                            "folder_path": current_path,
+                            "root": display_name,
+                            "error": str(exc),
+                        })
+
+                        print(
+                            f"[NSE] Listing failed for "
+                            f"{current_path}: {exc}",
+                            flush=True,
+                        )
+                        continue
+
+                    child_folders = []
+                    files_in_folder = []
+
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+
+                        name = item.get("name")
+                        item_type = str(
+                            item.get("type", "")
+                        ).lower()
+
+                        if (
+                            not isinstance(name, str)
+                            or not name.strip()
+                        ):
+                            continue
+
+                        name = name.strip()
+
+                        # Prevent names from escaping the selected root.
+                        if (
+                            name in {".", ".."}
+                            or "/" in name
+                            or "\\" in name
+                        ):
+                            continue
+
+                        if item_type == "folder":
+                            child_path = (
+                                current_path.rstrip("/")
+                                + "/"
+                                + name
+                                + "/"
+                            )
+
+                            child_folders.append(child_path)
+
+                        elif item_type == "file":
+                            files_in_folder.append(item)
+
+                    result["total_files_seen"] += len(
+                        files_in_folder
+                    )
+
+                    if files_in_folder:
+                        result["folders_with_files"] += 1
+
+                    # Download matching individual files.
+                    for file_item in files_in_folder:
+                        filename = file_item["name"]
+
+                        file_date = self._get_file_date(file_item)
+
+                        if file_date is None:
+                            result["skipped"] += 1
+
+                            result["downloads"].append({
+                                "status": "skipped",
+                                "segment": segment,
+                                "folder_path": current_path,
+                                "file_name": filename,
+                                "reason": (
+                                    "Missing or unrecognised "
+                                    "lastUpdated date."
+                                ),
+                            })
+
+                            print(
+                                f"[NSE] Skipping {filename}: "
+                                "lastUpdated date unavailable",
+                                flush=True,
+                            )
+                            continue
+
+                        if file_date != target_date:
+                            result["skipped"] += 1
+                            continue
+
+                        result["matching_files"] += 1
+
+                        print(
+                            f"[NSE] Downloading "
+                            f"{segment}/{current_path}{filename}",
+                            flush=True,
+                        )
+
+                        try:
+                            file_bytes = client.download_single_file(
+                                segment=segment,
+                                folder_path=current_path,
+                                filename=filename,
+                            )
+
+                            saved = self._save_file(
+                                segment=segment,
+                                folder_path=current_path,
+                                filename=filename,
+                                file_bytes=file_bytes,
+                                exchange_date=exchange_date,
+                            )
+
+                            result["downloads"].append(saved)
+
+                            if saved["status"] == "downloaded":
+                                result["downloaded"] += 1
+
+                            elif saved["status"] == "skipped":
+                                result["skipped"] += 1
+
+                        except Exception as exc:
+                            result["failed"] += 1
+
+                            failure = {
+                                "status": "failed",
+                                "segment": segment,
+                                "folder_path": current_path,
+                                "file_name": filename,
+                                "error": str(exc),
+                            }
+
+                            result["downloads"].append(failure)
+
+                            print(
+                                f"[NSE] Download failed for "
+                                f"{filename}: {exc}",
+                                flush=True,
+                            )
+
+                    # Always recurse into child folders.
+                    # Do not filter folders by their own lastUpdated date.
+                    for child_path in reversed(child_folders):
+                        if child_path not in visited:
+                            pending.append(
+                                (child_path, depth + 1)
+                            )
+
+                root_result["status"] = (
+                    "completed"
+                    if not any(
+                        failure["root"] == display_name
+                        for failure in result["failed_folders"]
+                    )
+                    else "partial"
+                )
+
+                result["roots_processed"] += 1
+
+                result.setdefault(
+                    "root_results",
+                    [],
+                ).append(root_result)
+
+                print(
+                    f"[NSE] Finished root {display_name}: "
+                    f"{root_result['folders_scanned']} folders scanned",
+                    flush=True,
+                )
+
+        if result["failed"] == 0:
+            result["status"] = "completed"
+
+        elif result["downloaded"] + result["skipped"] > 0:
+            result["status"] = "partial"
+
+        else:
+            result["status"] = "failed"
+
+        print(
+            f"[NSE] Download run finished: "
+            f"{result['downloaded']} downloaded, "
+            f"{result['skipped']} skipped, "
+            f"{result['failed']} failed.",
+            flush=True,
+        )
+
+        return result
 
     def download_folder(
         self,
@@ -178,28 +596,50 @@ class DownloaderService:
         folder_path: str,
         date: str,
     ) -> dict:
-        """Download one NSE folder as a ZIP archive."""
+        """Recursively download matching files from one NSE folder."""
 
-        segment = segment.upper().strip()
-
-        if segment not in SUPPORTED_SEGMENTS:
-            raise ValueError("Unsupported segment.")
-
+        segment = self._validate_segment(segment)
         date = self._validate_date(date)
         folder_path = self._validate_folder_path(folder_path)
 
-        with NSEExtranetClient() as client:
-            archive_bytes = client.download_bulk_folder(
-                segment=segment,
-                folder_path=folder_path,
-                date=date,
+        return self._process_paths(
+            segment=segment,
+            selected_paths=[
+                (folder_path.strip("/"), folder_path)
+            ],
+            exchange_date=date,
+        )
+
+    def download_root_folders(
+        self,
+        segment: str,
+        root_folders: list[str],
+        date: str,
+    ) -> dict:
+        """Recursively download matching files from selected root folders."""
+
+        segment = self._validate_segment(segment)
+        date = self._validate_date(date)
+
+        if not isinstance(root_folders, list) or not root_folders:
+            raise ValueError(
+                "Select at least one root folder."
             )
 
-        return self._save_archive(
+        selected_roots = list(dict.fromkeys(
+            self._normalise_root_name(root)
+            for root in root_folders
+        ))
+
+        selected_paths = [
+            (root_name, f"/{root_name}/")
+            for root_name in selected_roots
+        ]
+
+        return self._process_paths(
             segment=segment,
-            folder_path=folder_path,
-            date=date,
-            archive_bytes=archive_bytes,
+            selected_paths=selected_paths,
+            exchange_date=date,
         )
 
     def _get_cached_folders(self, segment: str) -> list:
@@ -229,31 +669,17 @@ class DownloaderService:
         segments: list[str],
         date: str,
     ) -> dict:
-        """
-        Download date-based ZIP archives using cached folder paths.
-
-        This method deliberately does not recursively scan NSE.
-        """
+        """Download matching individual files using cached folder paths."""
 
         date = self._validate_date(date)
 
-        selected_segments = list(dict.fromkeys(
-            str(segment).upper().strip()
-            for segment in segments
-        ))
-
-        if not selected_segments:
+        if not isinstance(segments, list) or not segments:
             raise ValueError("Select at least one segment.")
 
-        invalid_segments = [
-            segment for segment in selected_segments
-            if segment not in SUPPORTED_SEGMENTS
-        ]
-
-        if invalid_segments:
-            raise ValueError(
-                f"Unsupported segments: {', '.join(invalid_segments)}"
-            )
+        selected_segments = list(dict.fromkeys(
+            self._validate_segment(segment)
+            for segment in segments
+        ))
 
         results = []
 
@@ -262,77 +688,40 @@ class DownloaderService:
         total_failed = 0
 
         for segment in selected_segments:
-            segment_result = {
-                "segment": segment,
-                "status": "started",
-                "folders_found": 0,
-                "downloaded": 0,
-                "skipped": 0,
-                "failed": 0,
-                "downloads": [],
-            }
-
             try:
-                folders_to_download = self._get_cached_folders(segment)
-                segment_result["folders_found"] = len(
-                    folders_to_download
+                folders_to_download = self._get_cached_folders(
+                    segment
                 )
 
-                # One authenticated session for this segment.
-                with NSEExtranetClient() as client:
-                    for folder_path in folders_to_download:
-                        print(
-                            f"[NSE] Downloading "
-                            f"{segment}/{folder_path}",
-                            flush=True,
-                        )
+                selected_paths = [
+                    (folder.strip("/"), folder)
+                    for folder in folders_to_download
+                ]
 
-                        try:
-                            archive_bytes = client.download_bulk_folder(
-                                segment=segment,
-                                folder_path=folder_path,
-                                date=date,
-                            )
-
-                            result = self._save_archive(
-                                segment=segment,
-                                folder_path=folder_path,
-                                date=date,
-                                archive_bytes=archive_bytes,
-                            )
-
-                            segment_result["downloads"].append(result)
-
-                            if result["status"] == "downloaded":
-                                segment_result["downloaded"] += 1
-                                total_downloaded += 1
-
-                            elif result["status"] == "skipped":
-                                segment_result["skipped"] += 1
-                                total_skipped += 1
-
-                        except Exception as exc:
-                            segment_result["failed"] += 1
-                            total_failed += 1
-
-                            segment_result["downloads"].append({
-                                "status": "failed",
-                                "folder_path": folder_path,
-                                "error": str(exc),
-                            })
-
-                segment_result["status"] = (
-                    "completed"
-                    if segment_result["failed"] == 0
-                    else "partial"
+                segment_result = self._process_paths(
+                    segment=segment,
+                    selected_paths=selected_paths,
+                    exchange_date=date,
                 )
+
+                total_downloaded += segment_result["downloaded"]
+                total_skipped += segment_result["skipped"]
+                total_failed += segment_result["failed"]
+
+                results.append(segment_result)
 
             except Exception as exc:
-                segment_result["status"] = "failed"
-                segment_result["error"] = str(exc)
                 total_failed += 1
 
-            results.append(segment_result)
+                results.append({
+                    "segment": segment,
+                    "status": "failed",
+                    "error": str(exc),
+                    "downloaded": 0,
+                    "skipped": 0,
+                    "failed": 1,
+                    "downloads": [],
+                })
 
         return {
             "exchange_date": date,

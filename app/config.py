@@ -35,4 +35,21 @@ class Settings:
     def nse_credentials_configured(self) -> bool:
         return all((self.nse_member_code, self.nse_login_id, self.nse_password, self.nse_secret_key))
 
+
+# NSE download roots configured by segment.
+# Add more folder names whenever required.
+
+DOWNLOAD_ROOTS = {
+    "CM": [
+        "Accounts",
+        "NSP",
+        "Onlinebackup",
+        "Reports",
+    ],
+    "FO": [],
+    "CD": [],
+    "CO": [],
+    "SLB": [],
+}
+
 settings = Settings()

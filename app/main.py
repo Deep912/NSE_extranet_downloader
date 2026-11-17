@@ -1,20 +1,21 @@
 
 from contextlib import asynccontextmanager
 from pathlib import Path
-from app.services.folder_catalogue_service import FolderCatalogueService
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.config import settings
+from app.config import settings, DOWNLOAD_ROOTS
 from app.database import init_db, get_connection
 from app.services.downloader import DownloaderService
+from app.services.folder_catalogue_service import FolderCatalogueService
 from app.services.nse_client import NSEExtranetClient, NSEAPIError
 
-BASE_DIR = Path(__file__).resolve().parent
-downloader = DownloaderService()
 
+BASE_DIR = Path(__file__).resolve().parent
+
+downloader = DownloaderService()
 catalogue_service = FolderCatalogueService()
 
 SUPPORTED_SEGMENTS = {"CM", "FO", "CD", "CO", "SLB"}
@@ -33,6 +34,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
 app.mount(
     "/static",
     StaticFiles(directory=BASE_DIR / "static"),
@@ -40,16 +42,50 @@ app.mount(
 )
 
 
+# --------------------------------------------------
+# VALIDATION HELPERS
+# --------------------------------------------------
 
-def validate_folder_request(payload: dict):
-    segment = str(payload.get("segment", "CM")).upper().strip()
-    folder_path = str(payload.get("folder_path", "/")).strip() or "/"
+def validate_segment(segment):
+    if not isinstance(segment, str):
+        raise HTTPException(
+            status_code=400,
+            detail="Segment must be a string.",
+        )
+
+    segment = segment.strip().upper()
 
     if segment not in SUPPORTED_SEGMENTS:
         raise HTTPException(
             status_code=400,
             detail=f"Unsupported segment: {segment}",
         )
+
+    return segment
+
+
+def validate_date(date):
+    if not isinstance(date, str) or not date.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="date is required in DD-MM-YYYY format.",
+        )
+
+    return date.strip()
+
+
+def validate_folder_request(payload: dict):
+    segment = validate_segment(payload.get("segment", "CM"))
+
+    folder_path = payload.get("folder_path", "/")
+
+    if not isinstance(folder_path, str):
+        raise HTTPException(
+            status_code=400,
+            detail="folder_path must be a string.",
+        )
+
+    folder_path = folder_path.strip() or "/"
 
     if (
         not folder_path.startswith("/")
@@ -67,6 +103,9 @@ def validate_folder_request(payload: dict):
     return segment, folder_path
 
 
+# --------------------------------------------------
+# DASHBOARD AND HEALTH
+# --------------------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
@@ -86,11 +125,18 @@ def health():
 
 @app.get("/api/segments")
 def list_segments():
-    return {"segments": sorted(SUPPORTED_SEGMENTS)}
+    return {
+        "segments": sorted(SUPPORTED_SEGMENTS)
+    }
 
+
+# --------------------------------------------------
+# DOWNLOAD HISTORY
+# --------------------------------------------------
 
 @app.get("/api/downloads")
 def list_downloads(limit: int = 100):
+
     if limit < 1 or limit > 500:
         raise HTTPException(
             status_code=400,
@@ -99,17 +145,31 @@ def list_downloads(limit: int = 100):
 
     with get_connection() as conn:
         rows = conn.execute(
-            """SELECT id, segment, exchange_date, file_name, folder_path,
-                      status, downloaded_at, error_message
-               FROM downloads ORDER BY id DESC LIMIT ?""",
+            """
+            SELECT
+                id,
+                segment,
+                exchange_date,
+                file_name,
+                folder_path,
+                status,
+                downloaded_at,
+                error_message
+            FROM downloads
+            ORDER BY id DESC
+            LIMIT ?
+            """,
             (limit,),
         ).fetchall()
 
-    return {"downloads": [dict(row) for row in rows]}
+    return {
+        "downloads": [dict(row) for row in rows]
+    }
 
 
 @app.get("/api/runs")
 def list_runs(limit: int = 50):
+
     if limit < 1 or limit > 200:
         raise HTTPException(
             status_code=400,
@@ -118,35 +178,52 @@ def list_runs(limit: int = 50):
 
     with get_connection() as conn:
         rows = conn.execute(
-            """SELECT id, segment, mode, started_at, finished_at, status,
-                      files_found, files_downloaded, files_skipped, error_message
-               FROM download_runs ORDER BY id DESC LIMIT ?""",
+            """
+            SELECT
+                id,
+                segment,
+                mode,
+                started_at,
+                finished_at,
+                status,
+                files_found,
+                files_downloaded,
+                files_skipped,
+                error_message
+            FROM download_runs
+            ORDER BY id DESC
+            LIMIT ?
+            """,
             (limit,),
         ).fetchall()
 
-    return {"runs": [dict(row) for row in rows]}
+    return {
+        "runs": [dict(row) for row in rows]
+    }
 
+
+# --------------------------------------------------
+# LEGACY DOWNLOAD START ENDPOINT
+# --------------------------------------------------
 
 @app.post("/api/downloads/start")
 def start_download(payload: dict):
-    segment = str(payload.get("segment", "")).upper()
 
-    if segment not in SUPPORTED_SEGMENTS:
-        raise HTTPException(
-            status_code=400,
-            detail="Unsupported segment",
-        )
+    validate_segment(payload.get("segment", ""))
 
-    try:
-        result = downloader.start_segment_download(segment=segment)
-        return result
+    raise HTTPException(
+        status_code=501,
+        detail=(
+            "This legacy endpoint is not connected to the "
+            "date-based downloader. Use /api/nse/download-root "
+            "or /api/nse/download-segments instead."
+        ),
+    )
 
-    except NotImplementedError as exc:
-        raise HTTPException(
-            status_code=501,
-            detail=str(exc),
-        ) from exc
 
+# --------------------------------------------------
+# NSE FOLDER LISTING
+# --------------------------------------------------
 
 @app.post("/api/nse/list")
 def nse_list(payload: dict):
@@ -180,10 +257,14 @@ def nse_list(payload: dict):
 
     except ValueError as exc:
         raise HTTPException(
-            status_code=500,
+            status_code=400,
             detail=str(exc),
         ) from exc
 
+
+# --------------------------------------------------
+# RECURSIVE NSE SCAN
+# --------------------------------------------------
 
 @app.post("/api/nse/scan")
 def nse_scan(payload: dict):
@@ -208,27 +289,23 @@ def nse_scan(payload: dict):
 
     except ValueError as exc:
         raise HTTPException(
-            status_code=500,
+            status_code=400,
             detail=str(exc),
         ) from exc
 
 
+# --------------------------------------------------
+# NSE CATALOGUE SCAN
+# --------------------------------------------------
+
 @app.post("/api/nse/scan-catalogue")
-def scan_nse_catalogue(
-    segment: str = "CM",
-):
+def scan_nse_catalogue(segment: str = "CM"):
     """
     Scan NSE folders and save the discovered
     folder and file structure into SQLite.
     """
 
-    segment = segment.strip().upper()
-
-    if segment not in SUPPORTED_SEGMENTS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported segment: {segment}",
-        )
+    segment = validate_segment(segment)
 
     try:
         print(
@@ -236,15 +313,12 @@ def scan_nse_catalogue(
             flush=True,
         )
 
-        # Authenticate and scan NSE.
         with NSEExtranetClient() as client:
-
             scan_result = client.list_all_content(
                 segment=segment,
                 root_path="/",
             )
 
-        # Save the scan results into SQLite.
         saved_result = catalogue_service.save_scan_result(
             segment=segment,
             scan_result=scan_result,
@@ -270,12 +344,21 @@ def scan_nse_catalogue(
         }
 
     except NSEAPIError as exc:
-        print(f"[NSE] API error: {exc}", flush=True)
+        print(
+            f"[NSE] API error: {exc}",
+            flush=True,
+        )
 
         raise HTTPException(
             status_code=502,
             detail=f"NSE API error: {exc}",
-        )
+        ) from exc
+
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
 
     except Exception as exc:
         print(
@@ -286,28 +369,48 @@ def scan_nse_catalogue(
         raise HTTPException(
             status_code=500,
             detail="Catalogue scan failed. Check application logs.",
-        )
+        ) from exc
 
-@app.post("/api/nse/download-folder")
-def nse_download_folder(payload: dict):
-    """Download all files for one date from one NSE folder."""
 
-    segment, folder_path = validate_folder_request(payload)
-    date = str(payload.get("date", "")).strip()
+# --------------------------------------------------
+# DOWNLOAD CONFIGURED ROOT FOLDERS
+# --------------------------------------------------
 
-    if not date:
+@app.post("/api/nse/download-root")
+def nse_download_root(payload: dict):
+    """
+    Recursively scan configured NSE root folders
+    and download matching individual files.
+    """
+
+    segment = validate_segment(
+        payload.get("segment", "CM")
+    )
+
+    date = validate_date(
+        payload.get("date", "")
+    )
+
+    root_folders = payload.get("root_folders")
+
+    if root_folders is None:
+        root_folders = DOWNLOAD_ROOTS.get(segment, [])
+
+    if not isinstance(root_folders, list) or not root_folders:
         raise HTTPException(
             status_code=400,
-            detail="date is required in DD-MM-YYYY format.",
+            detail=(
+                f"No root folders configured for {segment}. "
+                "Check DOWNLOAD_ROOTS in app/config.py."
+            ),
         )
 
     try:
-        result = downloader.download_folder(
+        return downloader.download_root_folders(
             segment=segment,
-            folder_path=folder_path,
+            root_folders=root_folders,
             date=date,
         )
-        return result
 
     except ValueError as exc:
         raise HTTPException(
@@ -324,36 +427,28 @@ def nse_download_folder(payload: dict):
     except OSError as exc:
         raise HTTPException(
             status_code=500,
-            detail=f"Could not save the downloaded file: {exc}",
+            detail=f"Could not save downloaded files: {exc}",
         ) from exc
 
 
+# --------------------------------------------------
+# DOWNLOAD ONE FOLDER
+# --------------------------------------------------
 
-@app.post("/api/nse/download-segments")
-def nse_download_segments(payload: dict):
-    """
-    Scan and download all accessible folders
-    from the selected NSE segments.
-    """
+@app.post("/api/nse/download-folder")
+def nse_download_folder(payload: dict):
+    """Download matching files for one date from one NSE folder."""
 
-    segments = payload.get("segments", [])
-    date = str(payload.get("date", "")).strip()
+    segment, folder_path = validate_folder_request(payload)
 
-    if not isinstance(segments, list) or not segments:
-        raise HTTPException(
-            status_code=400,
-            detail="Select at least one segment.",
-        )
-
-    if not date:
-        raise HTTPException(
-            status_code=400,
-            detail="date is required in DD-MM-YYYY format.",
-        )
+    date = validate_date(
+        payload.get("date", "")
+    )
 
     try:
-        return downloader.download_segments(
-            segments=segments,
+        return downloader.download_folder(
+            segment=segment,
+            folder_path=folder_path,
             date=date,
         )
 
@@ -367,4 +462,70 @@ def nse_download_segments(payload: dict):
         raise HTTPException(
             status_code=502,
             detail=str(exc),
+        ) from exc
+
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not save downloaded files: {exc}",
+        ) from exc
+
+
+# --------------------------------------------------
+# DOWNLOAD MULTIPLE SEGMENTS
+# --------------------------------------------------
+
+@app.post("/api/nse/download-segments")
+def nse_download_segments(payload: dict):
+    """
+    Recursively scan and download matching files
+    from the selected NSE segments.
+    """
+
+    segments = payload.get("segments", [])
+
+    date = validate_date(
+        payload.get("date", "")
+    )
+
+    if not isinstance(segments, list) or not segments:
+        raise HTTPException(
+            status_code=400,
+            detail="Select at least one segment.",
+        )
+
+    validated_segments = []
+
+    for segment in segments:
+        validated_segments.append(
+            validate_segment(segment)
+        )
+
+    # Remove duplicate segment selections.
+    validated_segments = list(
+        dict.fromkeys(validated_segments)
+    )
+
+    try:
+        return downloader.download_segments(
+            segments=validated_segments,
+            date=date,
+        )
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+    except NSEAPIError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=str(exc),
+        ) from exc
+
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not save downloaded files: {exc}",
         ) from exc

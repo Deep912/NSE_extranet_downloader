@@ -30,16 +30,16 @@ class NSEExtranetClient:
         self._token: str | None = None
 
         self._http = httpx.Client(
-    base_url=self.base_url,
-    timeout=httpx.Timeout(
-    connect=20.0,
-    read=180.0,
-    write=30.0,
-    pool=20.0,
-    ),
-    headers={"Accept": "application/json"},
-    follow_redirects=False,
-)
+            base_url=self.base_url,
+            timeout=httpx.Timeout(
+                connect=20.0,
+                read=180.0,
+                write=30.0,
+                pool=20.0,
+            ),
+            headers={"Accept": "application/json"},
+            follow_redirects=False,
+        )
 
     @staticmethod
     def _response_json(response: httpx.Response) -> dict:
@@ -52,7 +52,9 @@ class NSEExtranetClient:
             ) from exc
 
         if not isinstance(payload, dict):
-            raise NSEAPIError("NSE returned an unexpected response format.")
+            raise NSEAPIError(
+                "NSE returned an unexpected response format."
+            )
 
         return payload
 
@@ -68,7 +70,11 @@ class NSEExtranetClient:
 
         return []
 
-    def _check_api_success(self, payload: dict, operation: str) -> None:
+    def _check_api_success(
+        self,
+        payload: dict,
+        operation: str,
+    ) -> None:
         codes = self._codes(payload)
 
         if self.SUCCESS_CODE not in codes:
@@ -140,26 +146,101 @@ class NSEExtranetClient:
         if not self._token:
             self.login()
 
-    
-    def list_content(self, segment: str, folder_path: str = "/") -> dict:
+    def _auth_headers(self) -> dict:
+        """Return headers for authenticated NSE API requests."""
+
+        self._ensure_authenticated()
+
+        return {
+            "Authorization": f"Bearer {self._token}",
+        }
+
+    @staticmethod
+    def _validate_folder_path(folder_path: str) -> str:
+        """Validate and normalise an NSE folder path."""
+
+        if (
+            not isinstance(folder_path, str)
+            or not folder_path.strip()
+            or "\\" in folder_path
+            or ".." in folder_path.split("/")
+        ):
+            raise NSEAPIError("Invalid NSE folder path.")
+
+        normalised = "/" + folder_path.strip("/")
+
+        if normalised == "":
+            normalised = "/"
+
+        return normalised
+
+    @staticmethod
+    def _validate_filename(filename: str) -> str:
+        """Validate a filename before sending it to NSE."""
+
+        if (
+            not isinstance(filename, str)
+            or not filename.strip()
+            or filename in {".", ".."}
+            or "/" in filename
+            or "\\" in filename
+        ):
+            raise NSEAPIError("Invalid NSE filename.")
+
+        return filename
+
+    def _download_error(
+        self,
+        response: httpx.Response,
+        operation: str,
+    ) -> NSEAPIError:
+        """Convert an NSE JSON or HTTP error into a readable exception."""
+
+        try:
+            payload = self._response_json(response)
+            codes = self._codes(payload)
+
+            description = (
+                payload.get("responseDesc")
+                or payload.get("reponseDesc")
+                or payload.get("status")
+                or "Unknown NSE error"
+            )
+
+            return NSEAPIError(
+                f"{operation} failed "
+                f"(HTTP {response.status_code}, "
+                f"code: {', '.join(codes) or 'unknown'}): "
+                f"{description}"
+            )
+
+        except NSEAPIError as exc:
+            return NSEAPIError(
+                f"{operation} failed "
+                f"(HTTP {response.status_code}): {exc}"
+            )
+
+    def list_content(
+        self,
+        segment: str,
+        folder_path: str = "/",
+    ) -> dict:
         """
         List files and folders inside an NSE Extranet directory.
 
         Retries the request once if NSE interrupts the response connection.
         """
 
-        self._ensure_authenticated()
+        folder_path = self._validate_folder_path(folder_path)
+        headers = self._auth_headers()
 
         endpoint = f"member/content/{self.version}"
+
         params = {
             "segment": segment,
             "folderPath": folder_path,
         }
-        headers = {
-            "Authorization": f"Bearer {self._token}",
-        }
 
-        # Attempt the GET request up to two times.
         for attempt in range(2):
             try:
                 response = self._http.get(
@@ -195,160 +276,95 @@ class NSEExtranetClient:
                     f"{type(exc).__name__}: {exc!r}"
                 ) from exc
 
-        # Parse the response.
         payload = self._response_json(response)
 
-        # Check HTTP status.
         if response.is_error:
             raise NSEAPIError(
                 f"NSE folder listing failed for {folder_path}: "
                 f"HTTP {response.status_code} - {payload}"
             )
 
-        # Check NSE API success code.
         self._check_api_success(payload, "folder listing")
 
         return payload
 
-
-    
     def download_single_file(
         self,
         segment: str,
         folder_path: str,
         filename: str,
     ) -> bytes:
-        self._ensure_authenticated()
-
-        response = self._http.get(
-            f"member/file/download/{self.version}",
-            params={
-                "segment": segment,
-                "folderPath": folder_path,
-                "filename": filename,
-            },
-            headers={
-                "Authorization": f"Bearer {self._token}",
-            },
-        )
-
-        content_type = response.headers.get("content-type", "").lower()
-
-        if response.is_error or "application/json" in content_type:
-            try:
-                payload = self._response_json(response)
-            except Exception:
-                payload = {}
-
-            raise NSEAPIError(
-                f"Single-file download failed: "
-                f"HTTP {response.status_code}, "
-                f"response={payload}"
-            )
-
-        return response.content
-
-    
-    def download_bulk_folder(
-        self,
-        segment: str,
-        folder_path: str,
-        date: str,
-    ) -> bytes:
         """
-        Download all files for a specified date from one NSE folder.
+        Download one individual file from NSE Extranet.
 
-        NSE documents multiple-file responses as GZIP.
-        Returns the original response bytes without modifying them.
+        The API requires:
+        - segment
+        - folderPath
+        - filename
+
+        Returns the original downloaded file bytes.
         """
 
-        from datetime import datetime
+        folder_path = self._validate_folder_path(folder_path)
+        filename = self._validate_filename(filename)
 
-        # Validate NSE's required date format.
-        try:
-            datetime.strptime(date, "%d-%m-%Y")
-        except ValueError as exc:
-            raise NSEAPIError(
-                "Invalid date. Expected format: DD-MM-YYYY."
-            ) from exc
+        headers = self._auth_headers()
 
-        if (
-            not folder_path
-            or "\\" in folder_path
-            or ".." in folder_path.split("/")
-        ):
-            raise NSEAPIError("Invalid NSE folder path.")
+        endpoint = f"member/file/download/{self.version}"
 
-        # NSE LIVE bulk API accepts paths such as Reports/
-        folder_path = folder_path.strip("/") + "/"
-
-        self._ensure_authenticated()
+        params = {
+            "segment": segment,
+            "folderPath": folder_path,
+            "filename": filename,
+        }
 
         try:
             response = self._http.get(
-                f"member/file/download/{self.version}",
-                params={
-                    "segment": segment,
-                    "folderPath": folder_path,
-                    "date": date,
-                },
-                headers={
-                    "Authorization": f"Bearer {self._token}",
-                },
+                endpoint,
+                params=params,
+                headers=headers,
             )
 
         except httpx.TimeoutException as exc:
             raise NSEAPIError(
-                f"NSE timed out downloading folder: {folder_path}"
+                f"NSE timed out downloading file: "
+                f"{folder_path}/{filename}"
             ) from exc
 
         except httpx.HTTPError as exc:
             raise NSEAPIError(
-                f"NSE bulk download request failed: "
-                f"{type(exc).__name__}"
+                f"NSE file download request failed for "
+                f"{filename}: {type(exc).__name__}: {exc}"
             ) from exc
 
-        # NSE may return a JSON error response instead of file data.
-        content_type = response.headers.get("content-type", "").lower()
-        body = response.content
+        content_type = response.headers.get(
+            "content-type",
+            "",
+        ).lower()
 
         if response.is_error or "application/json" in content_type:
-            try:
-                payload = self._response_json(response)
-                codes = self._codes(payload)
-                description = (
-                    payload.get("responseDesc")
-                    or payload.get("reponseDesc")
-                    or payload.get("status")
-                    or "Unknown NSE error"
-                )
-
-                raise NSEAPIError(
-                    f"NSE bulk download failed "
-                    f"(HTTP {response.status_code}, "
-                    f"code: {', '.join(codes) or 'unknown'}): "
-                    f"{description}"
-                )
-
-            except NSEAPIError:
-                raise
-
-        if not body:
-            raise NSEAPIError(
-                f"NSE returned an empty download for {folder_path}."
+            raise self._download_error(
+                response,
+                f"File download ({filename})",
             )
 
-        return body
+        if not response.content:
+            raise NSEAPIError(
+                f"NSE returned an empty file: {filename}"
+            )
 
-    
-    
+        return response.content
+
     def test_single_file_download(
         self,
         segment: str,
         folder_path: str,
         filename: str,
     ):
-        self._ensure_authenticated()
+        """Diagnostic request for one individual file."""
+
+        folder_path = self._validate_folder_path(folder_path)
+        filename = self._validate_filename(filename)
 
         response = self._http.get(
             f"member/file/download/{self.version}",
@@ -357,9 +373,7 @@ class NSEExtranetClient:
                 "folderPath": folder_path,
                 "filename": filename,
             },
-            headers={
-                "Authorization": f"Bearer {self._token}",
-            },
+            headers=self._auth_headers(),
         )
 
         print("HTTP status:", response.status_code)
@@ -369,7 +383,6 @@ class NSEExtranetClient:
 
         return response
 
-    
     def list_all_content(
         self,
         segment: str,
@@ -378,13 +391,18 @@ class NSEExtranetClient:
     ) -> dict:
         """Recursively scan folders and display progress."""
 
+        root_path = self._validate_folder_path(root_path)
+
         pending = [(root_path, 0)]
         visited = set()
         all_items = []
         failed_folders = []
         folders_scanned = 0
 
-        print(f"[NSE] Starting recursive scan: {segment}", flush=True)
+        print(
+            f"[NSE] Starting recursive scan: {segment}",
+            flush=True,
+        )
 
         while pending:
             current_path, depth = pending.pop()
@@ -423,6 +441,11 @@ class NSEExtranetClient:
 
                 items = result.get("data", [])
 
+                if not isinstance(items, list):
+                    raise NSEAPIError(
+                        f"Unexpected folder listing data for {current_path}"
+                    )
+
                 print(
                     f"[NSE] Completed {current_path} "
                     f"— {len(items)} items found",
@@ -451,6 +474,9 @@ class NSEExtranetClient:
                 if not isinstance(name, str) or not name.strip():
                     continue
 
+                if name in {".", ".."} or "/" in name or "\\" in name:
+                    continue
+
                 item_path = posixpath.normpath(
                     posixpath.join(current_path, name)
                 )
@@ -461,7 +487,10 @@ class NSEExtranetClient:
 
                 all_items.append(record)
 
-                if item_type == "folder" and item_path not in visited:
+                if (
+                    item_type == "folder"
+                    and item_path not in visited
+                ):
                     pending.append((item_path, depth + 1))
 
         files = [
@@ -512,8 +541,10 @@ class NSEExtranetClient:
                         "Authorization": f"Bearer {self._token}",
                     },
                 )
+
             except httpx.HTTPError:
                 pass
+
             finally:
                 self._token = None
 
