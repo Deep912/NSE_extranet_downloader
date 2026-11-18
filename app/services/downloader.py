@@ -7,6 +7,7 @@ from pathlib import Path
 
 from app.services.nse_client import NSEExtranetClient, NSEAPIError
 from app.services.folder_catalogue_service import FolderCatalogueService
+from app.services.download_history import DownloadHistory
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -26,12 +27,14 @@ class DownloaderService:
         download_root: Path = DOWNLOAD_ROOT,
         catalogue_service=None,
         client_factory=None,
+        history=None,
     ):
         self.download_root = Path(download_root)
         self.catalogue_service = (
             catalogue_service or FolderCatalogueService()
         )
         self.client_factory = client_factory or NSEExtranetClient
+        self.history = history or DownloadHistory()
 
     @staticmethod
     def _validate_date(exchange_date: str) -> str:
@@ -239,7 +242,7 @@ class DownloaderService:
 
             if existing_hash == file_hash:
                 return {
-                    "status": "skipped",
+                    "status": "already_downloaded",
                     "segment": segment,
                     "folder_path": folder_path,
                     "file_name": safe_filename,
@@ -262,7 +265,7 @@ class DownloaderService:
 
             if existing_hash == file_hash:
                 return {
-                    "status": "skipped",
+                    "status": "already_downloaded",
                     "segment": segment,
                     "folder_path": folder_path,
                     "file_name": destination_path.name,
@@ -302,12 +305,19 @@ class DownloaderService:
         segment: str,
         selected_paths: list[tuple[str, str]],
         exchange_date: str,
+        mode: str = "folder",
     ) -> dict:
         """
         Recursively list selected folders and download matching files.
 
         Each selected_paths entry contains:
             (display_name, NSE folder path)
+
+        The run and every matching file are recorded in the database.
+        Files already saved by an earlier run, and unchanged on NSE, are
+        skipped without downloading them again.
+
+        "skipped" is the total of other_date + no_date + already_downloaded.
         """
 
         target_date = datetime.strptime(
@@ -329,256 +339,348 @@ class DownloaderService:
             "matching_files": 0,
             "downloaded": 0,
             "skipped": 0,
+            "other_date": 0,
+            "no_date": 0,
+            "already_downloaded": 0,
             "failed": 0,
+            "failed_files": 0,
             "failed_folders": [],
             "downloads": [],
             "status": "started",
         }
 
-        with self.client_factory() as client:
+        run_id = self.history.start_run(
+            segment=segment,
+            exchange_date=exchange_date,
+            mode=mode,
+            roots=result["selected_roots"],
+        )
+        result["run_id"] = run_id
 
-            for display_name, root_path in selected_paths:
-                root_result = {
-                    "root": display_name,
-                    "folders_scanned": 0,
-                    "status": "started",
-                }
+        recorded = self.history.get_recorded_files(
+            segment,
+            exchange_date,
+        )
 
-                pending = [(root_path, 0)]
-                visited = set()
+        try:
+            with self.client_factory() as client:
 
-                print(
-                    f"[NSE] Starting selected root: "
-                    f"{segment}/{root_path}",
-                    flush=True,
-                )
+                for display_name, root_path in selected_paths:
+                    root_result = {
+                        "root": display_name,
+                        "folders_scanned": 0,
+                        "status": "started",
+                    }
 
-                while pending:
-                    current_path, depth = pending.pop()
-
-                    if current_path in visited:
-                        continue
-
-                    if depth > MAX_FOLDER_DEPTH:
-                        error = "Maximum folder depth exceeded."
-
-                        result["failed"] += 1
-                        result["failed_folders"].append({
-                            "folder_path": current_path,
-                            "root": display_name,
-                            "error": error,
-                        })
-                        continue
-
-                    if (
-                        root_result["folders_scanned"]
-                        >= MAX_FOLDERS_PER_ROOT
-                    ):
-                        error = (
-                            "Maximum folder limit reached for root."
-                        )
-
-                        result["failed"] += 1
-                        result["failed_folders"].append({
-                            "folder_path": current_path,
-                            "root": display_name,
-                            "error": error,
-                        })
-                        break
-
-                    visited.add(current_path)
-
-                    root_result["folders_scanned"] += 1
-                    result["folders_scanned"] += 1
+                    pending = [(root_path, 0)]
+                    visited = set()
 
                     print(
-                        f"[NSE] Listing {segment}/{current_path}",
+                        f"[NSE] Starting selected root: "
+                        f"{segment}/{root_path}",
                         flush=True,
                     )
 
-                    try:
-                        listing = client.list_content(
-                            segment=segment,
-                            folder_path=self._api_path(current_path),
-                        )
+                    while pending:
+                        current_path, depth = pending.pop()
 
-                        items = listing.get("data", [])
-
-                        if not isinstance(items, list):
-                            raise NSEAPIError(
-                                "Unexpected NSE folder listing format."
-                            )
-
-                    except Exception as exc:
-                        result["failed"] += 1
-
-                        result["failed_folders"].append({
-                            "folder_path": current_path,
-                            "root": display_name,
-                            "error": str(exc),
-                        })
-
-                        print(
-                            f"[NSE] Listing failed for "
-                            f"{current_path}: {exc}",
-                            flush=True,
-                        )
-                        continue
-
-                    child_folders = []
-                    files_in_folder = []
-
-                    for item in items:
-                        if not isinstance(item, dict):
+                        if current_path in visited:
                             continue
 
-                        name = item.get("name")
-                        item_type = str(
-                            item.get("type", "")
-                        ).lower()
+                        if depth > MAX_FOLDER_DEPTH:
+                            error = "Maximum folder depth exceeded."
 
-                        if (
-                            not isinstance(name, str)
-                            or not name.strip()
-                        ):
-                            continue
-
-                        name = name.strip()
-
-                        # Prevent names from escaping the selected root.
-                        if (
-                            name in {".", ".."}
-                            or "/" in name
-                            or "\\" in name
-                        ):
-                            continue
-
-                        if item_type == "folder":
-                            # current_path is "" (root) or ends with "/".
-                            child_path = f"{current_path}{name}/"
-
-                            child_folders.append(child_path)
-
-                        elif item_type == "file":
-                            files_in_folder.append(item)
-
-                    result["total_files_seen"] += len(
-                        files_in_folder
-                    )
-
-                    if files_in_folder:
-                        result["folders_with_files"] += 1
-
-                    # Download matching individual files.
-                    for file_item in files_in_folder:
-                        filename = file_item["name"]
-
-                        file_date = self._get_file_date(file_item)
-
-                        if file_date is None:
-                            result["skipped"] += 1
-
-                            result["downloads"].append({
-                                "status": "skipped",
-                                "segment": segment,
+                            result["failed"] += 1
+                            result["failed_folders"].append({
                                 "folder_path": current_path,
-                                "file_name": filename,
-                                "reason": (
-                                    "Missing or unrecognised "
-                                    "lastUpdated date."
-                                ),
+                                "root": display_name,
+                                "error": error,
                             })
+                            continue
 
-                            print(
-                                f"[NSE] Skipping {filename}: "
-                                "lastUpdated date unavailable",
-                                flush=True,
+                        if (
+                            root_result["folders_scanned"]
+                            >= MAX_FOLDERS_PER_ROOT
+                        ):
+                            error = (
+                                "Maximum folder limit reached for root."
                             )
-                            continue
 
-                        if file_date != target_date:
-                            result["skipped"] += 1
-                            continue
+                            result["failed"] += 1
+                            result["failed_folders"].append({
+                                "folder_path": current_path,
+                                "root": display_name,
+                                "error": error,
+                            })
+                            break
 
-                        result["matching_files"] += 1
+                        visited.add(current_path)
+
+                        root_result["folders_scanned"] += 1
+                        result["folders_scanned"] += 1
 
                         print(
-                            f"[NSE] Downloading "
-                            f"{segment}/{current_path}{filename}",
+                            f"[NSE] Listing {segment}/{current_path}",
                             flush=True,
                         )
 
                         try:
-                            file_bytes = client.download_single_file(
+                            listing = client.list_content(
                                 segment=segment,
                                 folder_path=self._api_path(current_path),
-                                filename=filename,
                             )
 
-                            saved = self._save_file(
-                                segment=segment,
-                                folder_path=current_path,
-                                filename=filename,
-                                file_bytes=file_bytes,
-                                exchange_date=exchange_date,
-                            )
+                            items = listing.get("data", [])
 
-                            result["downloads"].append(saved)
-
-                            if saved["status"] == "downloaded":
-                                result["downloaded"] += 1
-
-                            elif saved["status"] == "skipped":
-                                result["skipped"] += 1
+                            if not isinstance(items, list):
+                                raise NSEAPIError(
+                                    "Unexpected NSE folder listing format."
+                                )
 
                         except Exception as exc:
                             result["failed"] += 1
 
-                            failure = {
-                                "status": "failed",
-                                "segment": segment,
+                            result["failed_folders"].append({
                                 "folder_path": current_path,
-                                "file_name": filename,
+                                "root": display_name,
                                 "error": str(exc),
-                            }
-
-                            result["downloads"].append(failure)
+                            })
 
                             print(
-                                f"[NSE] Download failed for "
-                                f"{filename}: {exc}",
+                                f"[NSE] Listing failed for "
+                                f"{current_path}: {exc}",
+                                flush=True,
+                            )
+                            continue
+
+                        child_folders = []
+                        files_in_folder = []
+
+                        for item in items:
+                            if not isinstance(item, dict):
+                                continue
+
+                            name = item.get("name")
+                            item_type = str(
+                                item.get("type", "")
+                            ).lower()
+
+                            if (
+                                not isinstance(name, str)
+                                or not name.strip()
+                            ):
+                                continue
+
+                            name = name.strip()
+
+                            # Prevent names from escaping the selected root.
+                            if (
+                                name in {".", ".."}
+                                or "/" in name
+                                or "\\" in name
+                            ):
+                                continue
+
+                            if item_type == "folder":
+                                # current_path is "" (root) or ends with "/".
+                                child_path = f"{current_path}{name}/"
+
+                                child_folders.append(child_path)
+
+                            elif item_type == "file":
+                                files_in_folder.append(item)
+
+                        result["total_files_seen"] += len(
+                            files_in_folder
+                        )
+
+                        if files_in_folder:
+                            result["folders_with_files"] += 1
+
+                        # Download matching individual files.
+                        for file_item in files_in_folder:
+                            filename = file_item["name"]
+
+                            file_date = self._get_file_date(file_item)
+
+                            if file_date is None:
+                                result["skipped"] += 1
+                                result["no_date"] += 1
+
+                                result["downloads"].append({
+                                    "status": "skipped",
+                                    "segment": segment,
+                                    "folder_path": current_path,
+                                    "file_name": filename,
+                                    "reason": (
+                                        "Missing or unrecognised "
+                                        "lastUpdated date."
+                                    ),
+                                })
+
+                                print(
+                                    f"[NSE] Skipping {filename}: "
+                                    "lastUpdated date unavailable",
+                                    flush=True,
+                                )
+                                continue
+
+                            if file_date != target_date:
+                                result["skipped"] += 1
+                                result["other_date"] += 1
+                                continue
+
+                            result["matching_files"] += 1
+
+                            nse_last_updated = file_item.get("lastUpdated")
+
+                            # Already saved by an earlier run and unchanged on
+                            # NSE: skip without downloading it again.
+                            if self.history.is_already_downloaded(
+                                recorded.get((current_path, filename)),
+                                nse_last_updated,
+                            ):
+                                self.history.record_file(
+                                    run_id=run_id,
+                                    segment=segment,
+                                    exchange_date=exchange_date,
+                                    folder_path=current_path,
+                                    file_name=filename,
+                                    status="already_downloaded",
+                                    nse_last_updated=nse_last_updated,
+                                )
+
+                                result["skipped"] += 1
+                                result["already_downloaded"] += 1
+
+                                result["downloads"].append({
+                                    "status": "already_downloaded",
+                                    "source": "history",
+                                    "segment": segment,
+                                    "folder_path": current_path,
+                                    "file_name": filename,
+                                })
+                                continue
+
+                            print(
+                                f"[NSE] Downloading "
+                                f"{segment}/{current_path}{filename}",
                                 flush=True,
                             )
 
-                    # Always recurse into child folders.
-                    # Do not filter folders by their own lastUpdated date.
-                    for child_path in reversed(child_folders):
-                        if child_path not in visited:
-                            pending.append(
-                                (child_path, depth + 1)
-                            )
+                            try:
+                                file_bytes = client.download_single_file(
+                                    segment=segment,
+                                    folder_path=self._api_path(current_path),
+                                    filename=filename,
+                                )
 
-                root_result["status"] = (
-                    "completed"
-                    if not any(
-                        failure["root"] == display_name
-                        for failure in result["failed_folders"]
+                                saved = self._save_file(
+                                    segment=segment,
+                                    folder_path=current_path,
+                                    filename=filename,
+                                    file_bytes=file_bytes,
+                                    exchange_date=exchange_date,
+                                )
+
+                                # Record before counting, so a database error
+                                # is reported once, as a failed file.
+                                self.history.record_file(
+                                    run_id=run_id,
+                                    segment=segment,
+                                    exchange_date=exchange_date,
+                                    folder_path=current_path,
+                                    file_name=filename,
+                                    status=saved["status"],
+                                    nse_last_updated=nse_last_updated,
+                                    local_path=saved["file_path"],
+                                    file_size=saved["file_size"],
+                                    sha256=saved["sha256"],
+                                )
+
+                                result["downloads"].append(saved)
+
+                                if saved["status"] == "downloaded":
+                                    result["downloaded"] += 1
+
+                                elif saved["status"] == "already_downloaded":
+                                    result["skipped"] += 1
+                                    result["already_downloaded"] += 1
+
+                            except Exception as exc:
+                                result["failed"] += 1
+                                result["failed_files"] += 1
+
+                                failure = {
+                                    "status": "failed",
+                                    "segment": segment,
+                                    "folder_path": current_path,
+                                    "file_name": filename,
+                                    "error": str(exc),
+                                }
+
+                                result["downloads"].append(failure)
+
+                                self.history.record_file(
+                                    run_id=run_id,
+                                    segment=segment,
+                                    exchange_date=exchange_date,
+                                    folder_path=current_path,
+                                    file_name=filename,
+                                    status="failed",
+                                    nse_last_updated=nse_last_updated,
+                                    error_message=str(exc),
+                                )
+
+                                print(
+                                    f"[NSE] Download failed for "
+                                    f"{filename}: {exc}",
+                                    flush=True,
+                                )
+
+                        # Always recurse into child folders.
+                        # Do not filter folders by their own lastUpdated date.
+                        for child_path in reversed(child_folders):
+                            if child_path not in visited:
+                                pending.append(
+                                    (child_path, depth + 1)
+                                )
+
+                    root_result["status"] = (
+                        "completed"
+                        if not any(
+                            failure["root"] == display_name
+                            for failure in result["failed_folders"]
+                        )
+                        else "partial"
                     )
-                    else "partial"
-                )
 
-                result["roots_processed"] += 1
+                    result["roots_processed"] += 1
 
-                result.setdefault(
-                    "root_results",
-                    [],
-                ).append(root_result)
+                    result.setdefault(
+                        "root_results",
+                        [],
+                    ).append(root_result)
 
-                print(
-                    f"[NSE] Finished root {display_name}: "
-                    f"{root_result['folders_scanned']} folders scanned",
-                    flush=True,
-                )
+                    print(
+                        f"[NSE] Finished root {display_name}: "
+                        f"{root_result['folders_scanned']} folders scanned",
+                        flush=True,
+                    )
+
+        except Exception as exc:
+            # Do not leave the run marked as 'running'.
+            self.history.finish_run(
+                run_id,
+                status="failed",
+                files_found=result["matching_files"],
+                files_downloaded=result["downloaded"],
+                files_skipped=result["already_downloaded"],
+                files_failed=result["failed_files"],
+                folders_failed=len(result["failed_folders"]),
+                error_message=f"{type(exc).__name__}: {exc}",
+            )
+            raise
 
         if result["failed"] == 0:
             result["status"] = "completed"
@@ -589,10 +691,31 @@ class DownloaderService:
         else:
             result["status"] = "failed"
 
+        failed_folders = result["failed_folders"]
+
+        self.history.finish_run(
+            run_id,
+            status=result["status"],
+            files_found=result["matching_files"],
+            files_downloaded=result["downloaded"],
+            files_skipped=result["already_downloaded"],
+            files_failed=result["failed_files"],
+            folders_failed=len(failed_folders),
+            error_message=(
+                f"{len(failed_folders)} folder(s) failed: "
+                + "; ".join(
+                    item["folder_path"] or "/"
+                    for item in failed_folders
+                )
+                if failed_folders else None
+            ),
+        )
+
         print(
-            f"[NSE] Download run finished: "
+            f"[NSE] Download run {run_id} finished: "
             f"{result['downloaded']} downloaded, "
-            f"{result['skipped']} skipped, "
+            f"{result['already_downloaded']} already downloaded, "
+            f"{result['other_date']} other dates, "
             f"{result['failed']} failed.",
             flush=True,
         )
@@ -617,6 +740,7 @@ class DownloaderService:
                 (folder_path.strip("/") or "/", folder_path)
             ],
             exchange_date=date,
+            mode="folder",
         )
 
     def download_root_folders(
@@ -649,6 +773,7 @@ class DownloaderService:
             segment=segment,
             selected_paths=selected_paths,
             exchange_date=date,
+            mode="root",
         )
 
     def _get_cached_folders(self, segment: str) -> list:
@@ -711,6 +836,7 @@ class DownloaderService:
                     segment=segment,
                     selected_paths=selected_paths,
                     exchange_date=date,
+                    mode="segments",
                 )
 
                 total_downloaded += segment_result["downloaded"]

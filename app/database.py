@@ -1,26 +1,55 @@
 
 import sqlite3
+from pathlib import Path
+
 from app.config import settings
 
 
-def get_connection():
-    """Create and return a SQLite database connection."""
+def get_connection(database_path: Path | None = None):
+    """
+    Create and return a SQLite database connection.
 
-    settings.database_path.parent.mkdir(
+    database_path defaults to the configured database; tests pass a
+    temporary path instead.
+    """
+
+    database_path = Path(database_path or settings.database_path)
+
+    database_path.parent.mkdir(
         parents=True,
         exist_ok=True
     )
 
-    conn = sqlite3.connect(settings.database_path)
+    conn = sqlite3.connect(database_path)
     conn.row_factory = sqlite3.Row
 
     return conn
 
 
-def init_db():
+def _add_missing_columns(conn, table: str, columns: dict) -> None:
+    """
+    Add columns that older databases do not have yet.
+
+    CREATE TABLE IF NOT EXISTS never changes an existing table, so new
+    columns are added here. Existing rows get NULL or the default.
+    """
+
+    existing = {
+        row["name"]
+        for row in conn.execute(f"PRAGMA table_info({table})")
+    }
+
+    for name, definition in columns.items():
+        if name not in existing:
+            conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
+            )
+
+
+def init_db(database_path: Path | None = None):
     """Initialise all application database tables."""
 
-    with get_connection() as conn:
+    with get_connection(database_path) as conn:
 
         # -------------------------------------------------
         # 1. Individual download history
@@ -130,3 +159,22 @@ def init_db():
                 error_message TEXT
             )
         """)
+
+        # -------------------------------------------------
+        # 6. Columns added after the first release
+        # -------------------------------------------------
+
+        # Links each file to the run that last processed it, and keeps
+        # what is needed to skip it next time without asking NSE.
+        _add_missing_columns(conn, "downloads", {
+            "run_id": "INTEGER",
+            "nse_last_updated": "TEXT",
+            "local_path": "TEXT",
+        })
+
+        _add_missing_columns(conn, "download_runs", {
+            "exchange_date": "TEXT",
+            "roots": "TEXT",
+            "files_failed": "INTEGER DEFAULT 0",
+            "folders_failed": "INTEGER DEFAULT 0",
+        })
