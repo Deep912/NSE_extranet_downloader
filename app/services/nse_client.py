@@ -220,6 +220,81 @@ class NSEExtranetClient:
                 f"(HTTP {response.status_code}): {exc}"
             )
 
+    # Transient failures worth retrying: timeouts, dropped connections
+    # and gateway errors. NSE API errors (704, 706, 712, 714, ...) and
+    # other HTTP errors are returned to the caller without retrying.
+    RETRY_DELAYS_SECONDS = (2, 5)
+    RETRYABLE_STATUS_CODES = {502, 503, 504}
+
+    def _get_with_retry(
+        self,
+        endpoint: str,
+        params: dict,
+        headers: dict,
+        description: str,
+    ) -> httpx.Response:
+        """
+        Send a GET request, retrying transient failures with a delay.
+
+        description is used in log and error messages, e.g.
+        "folder listing /Reports". It must not contain secrets.
+        """
+
+        attempts = len(self.RETRY_DELAYS_SECONDS) + 1
+
+        for attempt in range(1, attempts + 1):
+            try:
+                response = self._http.get(
+                    endpoint,
+                    params=params,
+                    headers=headers,
+                )
+
+            except httpx.TransportError as exc:
+                # Name the phase (ConnectTimeout, ReadTimeout, ReadError...).
+                reason = type(exc).__name__
+
+                if attempt == attempts:
+                    timed_out = isinstance(exc, httpx.TimeoutException)
+
+                    raise NSEAPIError(
+                        f"NSE {'timed out' if timed_out else 'request failed'} "
+                        f"for {description} after {attempts} attempts "
+                        f"({reason})"
+                    ) from exc
+
+            except httpx.HTTPError as exc:
+                # Not transient (e.g. an invalid request); do not retry.
+                raise NSEAPIError(
+                    f"NSE request failed for {description}: "
+                    f"{type(exc).__name__}"
+                ) from exc
+
+            else:
+                if response.status_code not in self.RETRYABLE_STATUS_CODES:
+                    return response
+
+                reason = f"HTTP {response.status_code}"
+
+                if attempt == attempts:
+                    raise NSEAPIError(
+                        f"NSE returned {reason} for {description} "
+                        f"after {attempts} attempts"
+                    )
+
+            delay = self.RETRY_DELAYS_SECONDS[attempt - 1]
+
+            print(
+                f"[NSE] {reason} for {description} "
+                f"(attempt {attempt}/{attempts}). "
+                f"Retrying in {delay}s...",
+                flush=True,
+            )
+
+            time.sleep(delay)
+
+        raise AssertionError("unreachable")
+
     def list_content(
         self,
         segment: str,
@@ -228,7 +303,7 @@ class NSEExtranetClient:
         """
         List files and folders inside an NSE Extranet directory.
 
-        Retries the request once if NSE interrupts the response connection.
+        Timeouts, dropped connections and HTTP 502/503/504 are retried.
         """
 
         folder_path = self._validate_folder_path(folder_path)
@@ -241,40 +316,12 @@ class NSEExtranetClient:
             "folderPath": folder_path,
         }
 
-        for attempt in range(2):
-            try:
-                response = self._http.get(
-                    endpoint,
-                    params=params,
-                    headers=headers,
-                )
-                break
-
-            except httpx.TimeoutException as exc:
-                raise NSEAPIError(
-                    f"NSE timed out while listing folder: {folder_path}"
-                ) from exc
-
-            except httpx.ReadError as exc:
-                if attempt == 0:
-                    print(
-                        f"[NSE] Connection interrupted for {folder_path}. "
-                        "Retrying once in 1 second...",
-                        flush=True,
-                    )
-                    time.sleep(1)
-                    continue
-
-                raise NSEAPIError(
-                    f"NSE response read failed for {folder_path} "
-                    f"after 2 attempts: {type(exc).__name__}: {exc!r}"
-                ) from exc
-
-            except httpx.HTTPError as exc:
-                raise NSEAPIError(
-                    f"NSE folder listing request failed for {folder_path}: "
-                    f"{type(exc).__name__}: {exc!r}"
-                ) from exc
+        response = self._get_with_retry(
+            endpoint,
+            params,
+            headers,
+            f"folder listing {folder_path}",
+        )
 
         payload = self._response_json(response)
 
@@ -318,24 +365,12 @@ class NSEExtranetClient:
             "filename": filename,
         }
 
-        try:
-            response = self._http.get(
-                endpoint,
-                params=params,
-                headers=headers,
-            )
-
-        except httpx.TimeoutException as exc:
-            raise NSEAPIError(
-                f"NSE timed out downloading file: "
-                f"{folder_path}/{filename}"
-            ) from exc
-
-        except httpx.HTTPError as exc:
-            raise NSEAPIError(
-                f"NSE file download request failed for "
-                f"{filename}: {type(exc).__name__}: {exc}"
-            ) from exc
+        response = self._get_with_retry(
+            endpoint,
+            params,
+            headers,
+            f"file download {folder_path.rstrip('/')}/{filename}",
+        )
 
         content_type = response.headers.get(
             "content-type",
