@@ -7,15 +7,18 @@
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <main class="shell">
+  <div class="app">
 
-    <!-- Header with mascot -->
-    <header class="top">
-      <div class="title">
+    <!-- Top bar -->
+    <header class="topbar">
+      <div class="brand">
         <p class="eyebrow">NSE EXTRANET · LOCAL</p>
         <h1>Extranet Downloader</h1>
-        <p class="muted">Download a day's files for one or more segments, schedule nightly runs, browse NSE folders and check past runs.</p>
-        <span class="pill" id="apiStatus"><i></i> Checking app…</span>
+      </div>
+
+      <div class="top-pills">
+        <span class="pill" id="apiStatus"><i></i> Connecting…</span>
+        <span class="pill" id="clockPill" title="This computer's clock, used by schedules">--:--</span>
       </div>
 
       <figure class="mascot" aria-live="polite">
@@ -29,140 +32,149 @@
       <span id="busyText">NSE is busy.</span>
     </div>
 
-    <section class="grid">
+    <main class="layout">
 
-      <!-- Download -->
-      <article class="card">
-        <div class="card-head">
-          <h2>Download</h2>
-          <span class="muted small">Files whose NSE upload date matches</span>
+      <!-- Left column -->
+      <aside class="side">
+
+        <!-- Download -->
+        <section class="card">
+          <div class="card-head">
+            <h2>Download</h2>
+            <span class="muted small">by NSE upload date</span>
+          </div>
+
+          <label for="date">Exchange date</label>
+          <div class="row">
+            <input id="date" type="date">
+            <button class="chip" type="button" data-day="0">Today</button>
+            <button class="chip" type="button" data-day="-1">Yesterday</button>
+          </div>
+
+          <label>Segments</label>
+          <div class="chips" id="segmentChips" role="group" aria-label="Segments"></div>
+
+          <label>Scope</label>
+          <div class="segmented" role="radiogroup" aria-label="Scope">
+            <label class="seg-option">
+              <input type="radio" name="scope" value="segment" checked>
+              <span>Whole segment</span>
+            </label>
+            <label class="seg-option">
+              <input type="radio" name="scope" value="folder">
+              <span>One folder</span>
+            </label>
+          </div>
+
+          <div id="folderScope" class="hidden">
+            <label for="scopeFolder">Folder path <span class="muted">(subfolders included)</span></label>
+            <input id="scopeFolder" type="text" value="/Reports" spellcheck="false" autocomplete="off">
+          </div>
+
+          <button id="startDownload" class="primary wide" type="button">Download</button>
+          <p class="muted small center" id="downloadTimer">Files you already have are skipped.</p>
+
+          <ul class="progress" id="downloadProgress"></ul>
+        </section>
+
+        <!-- Schedules -->
+        <section class="card grow">
+          <div class="card-head">
+            <div>
+              <h2>Schedules</h2>
+              <p class="muted small" id="schedulerInfo">Loading…</p>
+            </div>
+            <button id="addSchedule" class="secondary" type="button">+ Add</button>
+          </div>
+
+          <div id="scheduleList" class="schedule-list scroll"></div>
+        </section>
+      </aside>
+
+      <!-- Right panel: Runs / Browse -->
+      <section class="card main-panel">
+        <div class="tabbar">
+          <div class="tabs" role="tablist" aria-label="Views">
+            <button type="button" role="tab" id="tabRuns" aria-controls="panelRuns" aria-selected="true">
+              Runs <span class="count" id="runsCount"></span>
+            </button>
+            <button type="button" role="tab" id="tabBrowse" aria-controls="panelBrowse" aria-selected="false">
+              Browse NSE
+            </button>
+          </div>
+
+          <div class="tab-tools" id="runsTools">
+            <select id="runsSegment" aria-label="Filter runs by segment">
+              <option value="">All segments</option>
+            </select>
+            <label class="toggle"><input type="checkbox" id="problemsOnly"> Problems only</label>
+            <button id="refreshRuns" class="secondary" type="button">Refresh</button>
+          </div>
         </div>
 
-        <label for="date">Exchange date</label>
-        <div class="row">
-          <input id="date" type="date">
-          <button class="chip" type="button" data-day="0">Today</button>
-          <button class="chip" type="button" data-day="-1">Yesterday</button>
+        <!-- Runs -->
+        <div id="panelRuns" role="tabpanel" aria-labelledby="tabRuns" class="panel split">
+          <div class="pane">
+            <div class="table-wrap scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>#</th><th>Date</th><th>Segment</th><th>Scope</th><th>Status</th>
+                    <th class="num">Matching</th><th class="num">New</th><th class="num">Had</th><th class="num">Failed</th>
+                    <th>Started</th><th>Took</th>
+                  </tr>
+                </thead>
+                <tbody id="runs">
+                  <tr><td colspan="11" class="muted">Loading…</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="pane">
+            <div class="pane-head">
+              <h3 id="runFilesTitle">Files</h3>
+              <label class="toggle"><input type="checkbox" id="failedOnly"> Failed only</label>
+            </div>
+            <div class="table-wrap scroll">
+              <table>
+                <thead><tr><th>File</th><th>Folder</th><th>Status</th><th class="num">Size</th><th>Note</th></tr></thead>
+                <tbody id="runFileRows">
+                  <tr><td colspan="5" class="empty-cell">Click a run above to see its files.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
         </div>
 
-        <label>Segments</label>
-        <div class="chips" id="segmentChips" role="group" aria-label="Segments"></div>
+        <!-- Browse -->
+        <div id="panelBrowse" role="tabpanel" aria-labelledby="tabBrowse" class="panel hidden">
+          <div class="row">
+            <select id="browseSegment" aria-label="Segment"></select>
+            <input id="browsePath" type="text" value="/" spellcheck="false" autocomplete="off" aria-label="Folder path">
+            <button id="browseGo" class="secondary" type="button">Open</button>
+            <button id="useFolder" class="secondary" type="button">Use for download</button>
+          </div>
 
-        <label>Scope</label>
-        <div class="segmented" role="radiogroup" aria-label="Scope">
-          <label class="seg-option">
-            <input type="radio" name="scope" value="segment" checked>
-            <span>Whole segment</span>
-          </label>
-          <label class="seg-option">
-            <input type="radio" name="scope" value="folder">
-            <span>One folder</span>
-          </label>
+          <nav class="crumbs" id="crumbs" aria-label="Folder path"></nav>
+
+          <div class="table-wrap scroll fill">
+            <table>
+              <thead><tr><th>Name</th><th>Last updated</th></tr></thead>
+              <tbody id="browseItems">
+                <tr><td colspan="2" class="empty-cell">Pick a segment and press Open.</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p class="muted small" id="browseInfo">Read-only. One NSE login at a time, so browsing waits while a download runs.</p>
         </div>
+      </section>
+    </main>
+  </div>
 
-        <div id="folderScope" class="hidden">
-          <label for="scopeFolder">Folder path</label>
-          <input id="scopeFolder" type="text" value="/Reports" spellcheck="false" autocomplete="off">
-          <p class="muted small">Includes all subfolders. Tip: browse to a folder and press “Use for download”.</p>
-        </div>
-
-        <div class="actions">
-          <button id="startDownload" class="primary" type="button">Download</button>
-          <span class="muted small" id="downloadTimer"></span>
-        </div>
-
-        <ul class="progress" id="downloadProgress"></ul>
-      </article>
-
-      <!-- Browse -->
-      <article class="card">
-        <div class="card-head">
-          <h2>Browse NSE</h2>
-          <span class="muted small">Read-only listing</span>
-        </div>
-
-        <div class="row">
-          <select id="browseSegment" aria-label="Segment"></select>
-          <input id="browsePath" type="text" value="/" spellcheck="false" autocomplete="off" aria-label="Folder path">
-          <button id="browseGo" class="secondary" type="button">Open</button>
-        </div>
-
-        <nav class="crumbs" id="crumbs" aria-label="Folder path"></nav>
-
-        <div class="table-wrap browse-wrap">
-          <table>
-            <thead><tr><th>Name</th><th>Last updated</th></tr></thead>
-            <tbody id="browseItems">
-              <tr><td colspan="2" class="muted">Pick a segment and open a folder.</td></tr>
-            </tbody>
-          </table>
-        </div>
-
-        <div class="actions">
-          <button id="useFolder" class="secondary" type="button">Use for download</button>
-          <span class="muted small" id="browseInfo"></span>
-        </div>
-      </article>
-    </section>
-
-    <!-- Schedules -->
-    <section class="card section">
-      <div class="card-head">
-        <div>
-          <h2>Schedules</h2>
-          <p class="muted small" id="clock">Times use this computer's clock.</p>
-        </div>
-        <button id="addSchedule" class="secondary" type="button">Add schedule</button>
-      </div>
-
-      <div id="scheduleList" class="schedule-list">
-        <p class="muted">Loading…</p>
-      </div>
-    </section>
-
-    <!-- Runs -->
-    <section class="card">
-      <div class="card-head">
-        <div>
-          <h2>Runs</h2>
-          <p class="muted small">Every download is recorded. Click a run to see its files.</p>
-        </div>
-        <button id="refreshRuns" class="secondary" type="button">Refresh</button>
-      </div>
-
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>#</th><th>Date</th><th>Segment</th><th>Scope</th><th>Status</th>
-              <th class="num">Matching</th><th class="num">New</th><th class="num">Had</th><th class="num">Failed</th>
-              <th>Started</th><th>Took</th>
-            </tr>
-          </thead>
-          <tbody id="runs">
-            <tr><td colspan="11" class="muted">Loading…</td></tr>
-          </tbody>
-        </table>
-      </div>
-
-      <div id="runFiles" class="hidden">
-        <div class="card-head sub">
-          <h3 id="runFilesTitle">Files</h3>
-          <label class="toggle"><input type="checkbox" id="failedOnly"> Failed only</label>
-        </div>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>File</th><th>Folder</th><th>Status</th><th class="num">Size</th><th>Note</th></tr></thead>
-            <tbody id="runFileRows"></tbody>
-          </table>
-        </div>
-      </div>
-    </section>
-
-    <footer>
-      One NSE login at a time: browsing and manual downloads wait while any download runs.
-    </footer>
-  </main>
+  <!-- Notifications -->
+  <div class="toasts" id="toasts" aria-live="polite"></div>
 
   <!-- Schedule editor -->
   <dialog id="scheduleDialog" aria-labelledby="scheduleDialogTitle">

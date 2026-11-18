@@ -1,10 +1,11 @@
 "use strict";
 
-// --------------------------------------------------
+// ==========================================================
 // HELPERS
-// --------------------------------------------------
+// ==========================================================
 
 const $ = (selector) => document.querySelector(selector);
+const $$ = (selector) => [...document.querySelectorAll(selector)];
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, c => ({
@@ -26,14 +27,16 @@ async function api(url, body, method) {
   try {
     data = await response.json();
   } catch {
-    // Non-JSON error page; fall through to the status message.
+    // Non-JSON error page; use the status below.
   }
 
   if (!response.ok) {
     const detail = data && data.detail;
-    throw new Error(
+    const error = new Error(
       typeof detail === "string" ? detail : `Request failed (HTTP ${response.status})`
     );
+    error.status = response.status;
+    throw error;
   }
 
   return data;
@@ -82,12 +85,38 @@ function localTime(iso) {
   return date.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 }
 
+// Shorter form for tables: "18 Nov, 05:00 pm" (year only if not this year).
+function shortTime(iso) {
+  if (!iso) return "—";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return iso;
+  const options = { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" };
+  if (date.getFullYear() !== new Date().getFullYear()) options.year = "numeric";
+  return date.toLocaleString(undefined, options);
+}
+
+function seconds(total) {
+  total = Math.max(0, Math.round(total));
+  if (total < 60) return `${total}s`;
+  return `${Math.floor(total / 60)}m ${String(total % 60).padStart(2, "0")}s`;
+}
+
 function duration(startIso, endIso) {
   if (!startIso || !endIso) return "—";
-  const seconds = Math.max(0, Math.round((new Date(endIso) - new Date(startIso)) / 1000));
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  return `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
+  return seconds((new Date(endIso) - new Date(startIso)) / 1000);
+}
+
+function relativeDay(iso) {
+  if (!iso) return "—";
+  const date = new Date(iso);
+  const today = new Date();
+  const tomorrow = new Date();
+  tomorrow.setDate(today.getDate() + 1);
+  const time = date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+
+  if (date.toDateString() === today.toDateString()) return `today ${time}`;
+  if (date.toDateString() === tomorrow.toDateString()) return `tomorrow ${time}`;
+  return `${date.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" })} ${time}`;
 }
 
 // NSE paths: "/" for the root, "/Reports/Sub" otherwise.
@@ -96,14 +125,56 @@ function normalisePath(path) {
   return "/" + parts.join("/");
 }
 
-function joinPath(base, name) {
-  return normalisePath(`${base}/${name}`);
+const joinPath = (base, name) => normalisePath(`${base}/${name}`);
+
+
+// ==========================================================
+// FEEDBACK: toasts + loading buttons
+// ==========================================================
+
+function toast(message, kind = "info", timeout = 4500) {
+  const element = document.createElement("div");
+  element.className = `toast ${kind}`;
+  element.setAttribute("role", kind === "bad" ? "alert" : "status");
+  element.innerHTML = `<span class="msg">${escapeHtml(message)}</span>
+                       <button type="button" aria-label="Dismiss">×</button>`;
+
+  const close = () => {
+    element.classList.add("leaving");
+    setTimeout(() => element.remove(), 200);
+  };
+
+  element.querySelector("button").addEventListener("click", close);
+  $("#toasts").append(element);
+
+  // Keep at most 4 on screen.
+  const all = $$("#toasts .toast:not(.leaving)");
+  if (all.length > 4) all[0].remove();
+
+  if (timeout) setTimeout(close, timeout);
+}
+
+// Show a spinner and busy label on a button while fn() runs.
+async function withLoading(button, busyLabel, fn) {
+  const label = button.textContent;
+  button.classList.add("loading");
+  button.disabled = true;
+  button.textContent = busyLabel;
+
+  try {
+    return await fn();
+  } finally {
+    button.classList.remove("loading");
+    button.textContent = label;
+    button.disabled = false;
+    applyBusy();
+  }
 }
 
 
-// --------------------------------------------------
+// ==========================================================
 // MASCOT
-// --------------------------------------------------
+// ==========================================================
 
 const cat = (face, extra = ["", "", ""]) => [
   ` /\\_/\\  ${extra[0]}`,
@@ -139,40 +210,69 @@ function setMood(mood, message) {
 }
 
 
-// --------------------------------------------------
+// ==========================================================
 // STATE
-// --------------------------------------------------
+// ==========================================================
 
 const SEGMENT_ORDER = ["CM", "FO", "CD", "CO", "SLB"];
+const DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
 const state = {
   segments: [],
   selected: new Set(store.get("segments", ["CM"])),
   busy: false,
   localBusy: false,   // a download started from this page
-  remoteBusy: false,  // NSE in use by a schedule or another tab
+  remoteBusy: false,  // NSE used by a schedule or another tab
   browsePath: "/",
+  browseLoaded: false,
   selectedRun: null,
   runs: [],
   schedules: [],
   defaults: null,
   editingId: null,
+  serverOffsetMs: 0,
+  timezone: "",
 };
 
+// Controls that need NSE are disabled while anything else uses it.
 function applyBusy() {
   const busy = state.localBusy || state.remoteBusy;
   state.busy = busy;
 
-  document.querySelectorAll(
+  $$(
     "#startDownload, #segmentChips button, [data-day], #date, input[name='scope'], #scopeFolder, " +
     "#browseSegment, #browsePath, #browseGo, #useFolder, #crumbs button, #browseItems button"
-  ).forEach(element => { element.disabled = busy; });
+  ).forEach(element => {
+    if (!element.classList.contains("loading")) element.disabled = busy;
+  });
 }
 
 
-// --------------------------------------------------
-// APP STATUS + SEGMENTS
-// --------------------------------------------------
+// ==========================================================
+// TABS
+// ==========================================================
+
+function showTab(name) {
+  const runs = name === "runs";
+
+  $("#tabRuns").setAttribute("aria-selected", String(runs));
+  $("#tabBrowse").setAttribute("aria-selected", String(!runs));
+  $("#panelRuns").classList.toggle("hidden", !runs);
+  $("#panelBrowse").classList.toggle("hidden", runs);
+  $("#runsTools").classList.toggle("hidden", !runs);
+
+  store.set("tab", name);
+
+  if (!runs && !state.browseLoaded && !state.busy) openFolder("/");
+}
+
+$("#tabRuns").addEventListener("click", () => showTab("runs"));
+$("#tabBrowse").addEventListener("click", () => showTab("browse"));
+
+
+// ==========================================================
+// APP STATUS, CLOCK, SEGMENTS
+// ==========================================================
 
 async function checkHealth() {
   const pill = $("#apiStatus");
@@ -185,6 +285,12 @@ async function checkHealth() {
     pill.className = "pill down";
     pill.innerHTML = "<i></i> App not reachable";
   }
+}
+
+function tickClock() {
+  const now = new Date(Date.now() + state.serverOffsetMs);
+  const time = now.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  $("#clockPill").textContent = `${time}${state.timezone ? ` · ${state.timezone}` : ""}`;
 }
 
 async function loadSegments() {
@@ -205,10 +311,13 @@ async function loadSegments() {
 
   renderSegmentChips();
 
-  $("#browseSegment").innerHTML = state.segments
-    .map(s => `<option value="${escapeHtml(s)}">${escapeHtml(s)}</option>`)
-    .join("");
+  const options = state.segments
+    .map(s => `<option value="${escapeHtml(s)}">${escapeHtml(s)}</option>`).join("");
+
+  $("#browseSegment").innerHTML = options;
   $("#browseSegment").value = state.segments.includes("CM") ? "CM" : state.segments[0];
+  $("#runsSegment").innerHTML = `<option value="">All segments</option>${options}`;
+
   renderCrumbs(state.browsePath);
 }
 
@@ -218,9 +327,10 @@ function renderSegmentChips() {
   $("#segmentChips").innerHTML =
     state.segments.map(s => `
       <button type="button" class="chip" data-segment="${escapeHtml(s)}"
-              aria-pressed="${state.selected.has(s)}">${escapeHtml(s)}</button>`
-    ).join("") +
+              aria-pressed="${state.selected.has(s)}">${escapeHtml(s)}</button>`).join("") +
     `<button type="button" class="chip" data-segment="*" aria-pressed="${allOn}">All</button>`;
+
+  applyBusy();
 }
 
 $("#segmentChips").addEventListener("click", (event) => {
@@ -243,15 +353,17 @@ $("#segmentChips").addEventListener("click", (event) => {
 });
 
 
-// --------------------------------------------------
-// DATE + SCOPE
-// --------------------------------------------------
+// ==========================================================
+// DOWNLOAD
+// ==========================================================
 
 $("#date").value = localIsoDate(0);
 
-document.querySelectorAll("[data-day]").forEach(button => {
+$$("[data-day]").forEach(button => {
   button.addEventListener("click", () => {
     $("#date").value = localIsoDate(Number(button.dataset.day));
+    const label = Number(button.dataset.day) === 0 ? "today" : "yesterday";
+    $("#catSays").textContent = `ok, ${label}: ${toNseDate($("#date").value)}.`;
   });
 });
 
@@ -264,7 +376,7 @@ function showScope() {
   store.set("scope", currentScope());
 }
 
-document.querySelectorAll("input[name='scope']").forEach(radio => {
+$$("input[name='scope']").forEach(radio => {
   radio.checked = radio.value === store.get("scope", "segment");
   radio.addEventListener("change", showScope);
 });
@@ -273,23 +385,19 @@ $("#scopeFolder").value = store.get("folder", "/Reports");
 $("#scopeFolder").addEventListener("change", () => store.set("folder", $("#scopeFolder").value));
 showScope();
 
-
-// --------------------------------------------------
-// DOWNLOAD
-// --------------------------------------------------
-
 function progressRow(segment, status, body = "") {
+  const spinner = status === "running" ? '<span class="spinner" aria-hidden="true"></span>' : "";
   return `
     <li data-row="${escapeHtml(segment)}">
       <span class="seg">${escapeHtml(segment)}</span>
       <div>
         <span class="badge ${escapeHtml(status)}">${escapeHtml(status)}</span>
-        ${body}
+        ${spinner}${body}
       </div>
     </li>`;
 }
 
-function resultBody(result) {
+function resultBody(result, took) {
   const failedFiles = (result.downloads || []).filter(d => d.status === "failed");
   const failedFolders = result.failed_folders || [];
 
@@ -298,14 +406,14 @@ function resultBody(result) {
     ...failedFiles.map(f => `${f.file_name}: ${f.error}`),
   ];
 
-  const shown = problems.slice(0, 5)
-    .map(p => `<li>${escapeHtml(p)}</li>`).join("");
-  const more = problems.length > 5 ? `<li>+${problems.length - 5} more</li>` : "";
+  const shown = problems.slice(0, 4).map(p => `<li>${escapeHtml(p)}</li>`).join("");
+  const more = problems.length > 4 ? `<li>+${problems.length - 4} more (see Runs)</li>` : "";
 
   return `
+    <span class="muted small">${escapeHtml(took)}</span>
     <div class="counts">
       <span><b>${number(result.downloaded)}</b> new</span>
-      <span><b>${number(result.already_downloaded)}</b> already had</span>
+      <span><b>${number(result.already_downloaded)}</b> had</span>
       <span><b>${number(result.other_date)}</b> other dates</span>
       <span><b>${number(result.failed)}</b> failed</span>
       <span><b>${number(result.folders_scanned)}</b> folders</span>
@@ -318,29 +426,6 @@ function setRow(segment, html) {
   if (row) row.outerHTML = html;
 }
 
-let timerHandle = null;
-
-function startTimer() {
-  const started = Date.now();
-  const tick = () => {
-    const seconds = Math.round((Date.now() - started) / 1000);
-    $("#downloadTimer").textContent =
-      `Running… ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
-  };
-  tick();
-  timerHandle = setInterval(tick, 1000);
-  return started;
-}
-
-function stopTimer(started) {
-  clearInterval(timerHandle);
-  const seconds = Math.round((Date.now() - started) / 1000);
-  const took = seconds < 60
-    ? `${seconds}s`
-    : `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, "0")}s`;
-  $("#downloadTimer").textContent = `Finished in ${took}`;
-}
-
 async function startDownload() {
   if (state.busy) return;
 
@@ -349,75 +434,92 @@ async function startDownload() {
 
   if (!isoDate) {
     setMood("worried", "pick a date first.");
+    toast("Pick an exchange date first.", "warn");
+    $("#date").focus();
     return;
   }
 
   if (!segments.length) {
     setMood("worried", "pick at least one segment.");
+    toast("Select at least one segment.", "warn");
     return;
   }
 
   const date = toNseDate(isoDate);
   const folderPath = currentScope() === "folder" ? normalisePath($("#scopeFolder").value) : "/";
+  const button = $("#startDownload");
+  const started = Date.now();
 
   state.localBusy = true;
   applyBusy();
-  const started = startTimer();
+
+  const timer = setInterval(() => {
+    $("#downloadTimer").textContent = `Running for ${seconds((Date.now() - started) / 1000)}…`;
+  }, 1000);
+  $("#downloadTimer").textContent = "Starting…";
 
   $("#downloadProgress").innerHTML = segments.map(s => progressRow(s, "waiting")).join("");
 
   const totals = { downloaded: 0, already: 0, failed: 0, errors: 0 };
 
-  for (const segment of segments) {
-    const where = folderPath === "/" ? segment : `${segment}${folderPath}`;
-    setMood("work", `fetching ${where} for ${date}…`);
-    setRow(segment, progressRow(segment, "running", `<span class="muted small">listing folders and downloading…</span>`));
+  await withLoading(button, `Downloading ${segments.length > 1 ? `${segments.length} segments` : segments[0]}…`, async () => {
+    for (const segment of segments) {
+      const where = folderPath === "/" ? segment : `${segment}${folderPath}`;
+      const segmentStart = Date.now();
 
-    try {
-      const result = await api("/api/nse/download-folder", {
-        segment, folder_path: folderPath, date,
-      });
+      setMood("work", `fetching ${where} for ${date}…`);
+      setRow(segment, progressRow(segment, "running", `<span class="muted small">listing folders and downloading…</span>`));
 
-      totals.downloaded += result.downloaded || 0;
-      totals.already += result.already_downloaded || 0;
-      totals.failed += result.failed || 0;
+      try {
+        const result = await api("/api/nse/download-folder", { segment, folder_path: folderPath, date });
 
-      setRow(segment, progressRow(segment, result.status, resultBody(result)));
+        totals.downloaded += result.downloaded || 0;
+        totals.already += result.already_downloaded || 0;
+        totals.failed += result.failed || 0;
 
-    } catch (error) {
-      totals.errors += 1;
-      setRow(segment, progressRow(segment, "failed",
-        `<ul class="errors"><li>${escapeHtml(error.message)}</li></ul>`));
+        setRow(segment, progressRow(segment, result.status,
+          resultBody(result, seconds((Date.now() - segmentStart) / 1000))));
+
+      } catch (error) {
+        totals.errors += 1;
+        setRow(segment, progressRow(segment, "failed",
+          `<ul class="errors"><li>${escapeHtml(error.message)}</li></ul>`));
+      }
+
+      loadRuns();
     }
+  });
 
-    loadRuns();
-  }
-
-  stopTimer(started);
+  clearInterval(timer);
+  $("#downloadTimer").textContent = `Finished in ${seconds((Date.now() - started) / 1000)}.`;
   state.localBusy = false;
   applyBusy();
 
   if (totals.errors === segments.length) {
-    setMood("sad", "couldn't complete any segment. Check the errors.");
+    setMood("sad", "couldn't complete any segment. check the errors.");
+    toast(`Download for ${date} failed. See the errors under the Download button.`, "bad", 8000);
   } else if (totals.failed || totals.errors) {
-    setMood("worried", `${number(totals.downloaded)} new, but some failed. Run it again to retry those.`);
+    setMood("worried", `${number(totals.downloaded)} new, some failed. run it again to retry.`);
+    toast(`${number(totals.downloaded)} new file(s), but ${number(totals.failed + totals.errors)} failed. Running it again retries only those.`, "warn", 8000);
   } else if (totals.downloaded) {
-    setMood("happy", `done! ${number(totals.downloaded)} new file(s), ${number(totals.already)} already here.`);
+    setMood("happy", `done! ${number(totals.downloaded)} new, ${number(totals.already)} already here.`);
+    toast(`Done: ${number(totals.downloaded)} new file(s) for ${date}.`, "good");
   } else {
-    setMood("happy", `nothing new for ${date}. ${number(totals.already)} file(s) already here.`);
+    setMood("happy", `nothing new for ${date}. ${number(totals.already)} already here.`);
+    toast(`Nothing new for ${date}. ${number(totals.already)} file(s) already downloaded.`, "good");
   }
 }
 
 $("#startDownload").addEventListener("click", startDownload);
 
 
-// --------------------------------------------------
+// ==========================================================
 // BROWSE
-// --------------------------------------------------
+// ==========================================================
 
 function renderCrumbs(path) {
   const parts = path.split("/").filter(Boolean);
-  let html = `<button type="button" data-path="/">${escapeHtml($("#browseSegment").value)}</button>`;
+  let html = `<button type="button" data-path="/">${escapeHtml($("#browseSegment").value || "root")}</button>`;
   let current = "";
 
   for (const part of parts) {
@@ -426,52 +528,60 @@ function renderCrumbs(path) {
   }
 
   $("#crumbs").innerHTML = html;
+  applyBusy();
 }
 
 async function openFolder(path) {
-  if (state.busy) return;
+  if (state.busy) {
+    toast("NSE is busy with a download. Browsing will work again when it finishes.", "warn");
+    return;
+  }
 
   const segment = $("#browseSegment").value;
   path = normalisePath(path);
 
   state.browsePath = path;
+  state.browseLoaded = true;
   $("#browsePath").value = path;
   renderCrumbs(path);
 
-  $("#browseItems").innerHTML = `<tr><td colspan="2" class="muted">Asking NSE…</td></tr>`;
-  $("#browseInfo").textContent = "";
+  $("#browseItems").innerHTML =
+    `<tr><td colspan="2" class="empty-cell"><span class="spinner"></span>Asking NSE for ${escapeHtml(segment)}${escapeHtml(path === "/" ? "" : path)}…</td></tr>`;
   setMood("sniff", `sniffing around ${segment}${path === "/" ? "" : path}…`);
 
-  try {
-    const data = await api("/api/nse/list", { segment, folder_path: path });
-    const items = Array.isArray(data.items) ? data.items : [];
-    const isFolder = (item) => String(item.type).toLowerCase() === "folder";
+  await withLoading($("#browseGo"), "Opening…", async () => {
+    try {
+      const data = await api("/api/nse/list", { segment, folder_path: path });
+      const items = Array.isArray(data.items) ? data.items : [];
+      const isFolder = (item) => String(item.type).toLowerCase() === "folder";
 
-    const folders = items.filter(isFolder).sort((a, b) => a.name.localeCompare(b.name));
-    const files = items.filter(i => !isFolder(i))
-      .sort((a, b) => String(b.lastUpdated).localeCompare(String(a.lastUpdated)));
+      const folders = items.filter(isFolder).sort((a, b) => a.name.localeCompare(b.name));
+      const files = items.filter(i => !isFolder(i))
+        .sort((a, b) => String(b.lastUpdated).localeCompare(String(a.lastUpdated)));
 
-    $("#browseItems").innerHTML = (folders.length || files.length) ? [
-      ...folders.map(f => `
-        <tr>
-          <td><button type="button" class="folder-link" data-folder="${escapeHtml(f.name)}">${escapeHtml(f.name)}</button></td>
-          <td class="muted" title="UTC: ${escapeHtml(f.lastUpdated)}">${escapeHtml(localTime(f.lastUpdated))}</td>
-        </tr>`),
-      ...files.map(f => `
-        <tr>
-          <td class="file-name">${escapeHtml(f.name)}</td>
-          <td class="muted" title="UTC: ${escapeHtml(f.lastUpdated)}">${escapeHtml(localTime(f.lastUpdated))}</td>
-        </tr>`),
-    ].join("") : `<tr><td colspan="2" class="muted">This folder is empty.</td></tr>`;
+      $("#browseItems").innerHTML = (folders.length || files.length) ? [
+        ...folders.map(f => `
+          <tr>
+            <td><button type="button" class="folder-link" data-folder="${escapeHtml(f.name)}">${escapeHtml(f.name)}</button></td>
+            <td class="muted" title="UTC: ${escapeHtml(f.lastUpdated)}">${escapeHtml(localTime(f.lastUpdated))}</td>
+          </tr>`),
+        ...files.map(f => `
+          <tr>
+            <td class="file-name">${escapeHtml(f.name)}</td>
+            <td class="muted" title="UTC: ${escapeHtml(f.lastUpdated)}">${escapeHtml(localTime(f.lastUpdated))}</td>
+          </tr>`),
+      ].join("") : `<tr><td colspan="2" class="empty-cell">This folder is empty.</td></tr>`;
 
-    $("#browseInfo").textContent = `${folders.length} folder(s) · ${files.length} file(s)`;
-    setMood("sleep", `${folders.length} folder(s), ${files.length} file(s) in ${path}. back to napping.`);
+      $("#browseInfo").textContent =
+        `${segment}${path === "/" ? "" : path} · ${folders.length} folder(s) · ${files.length} file(s). Times are local; hover for UTC.`;
+      setMood("sleep", `${folders.length} folder(s), ${files.length} file(s) here. back to napping.`);
 
-  } catch (error) {
-    $("#browseItems").innerHTML =
-      `<tr><td colspan="2" class="note">${escapeHtml(error.message)}</td></tr>`;
-    setMood("worried", "NSE didn't answer that one.");
-  }
+    } catch (error) {
+      $("#browseItems").innerHTML = `<tr><td colspan="2" class="empty-cell note">${escapeHtml(error.message)}</td></tr>`;
+      setMood("worried", "NSE didn't answer that one.");
+      toast(error.message, error.status === 409 ? "warn" : "bad", 7000);
+    }
+  });
 }
 
 $("#browseGo").addEventListener("click", () => openFolder($("#browsePath").value));
@@ -492,24 +602,26 @@ $("#browseItems").addEventListener("click", (event) => {
 
 $("#useFolder").addEventListener("click", () => {
   const segment = $("#browseSegment").value;
+  const whole = state.browsePath === "/";
 
   state.selected = new Set([segment]);
   store.set("segments", [...state.selected]);
   renderSegmentChips();
 
-  const scope = state.browsePath === "/" ? "segment" : "folder";
-  document.querySelector(`input[name='scope'][value='${scope}']`).checked = true;
+  document.querySelector(`input[name='scope'][value='${whole ? "segment" : "folder"}']`).checked = true;
   $("#scopeFolder").value = state.browsePath;
   store.set("folder", state.browsePath);
   showScope();
 
-  setMood("happy", `ok, next download: ${segment}${state.browsePath === "/" ? " (whole segment)" : state.browsePath}.`);
+  const target = `${segment}${whole ? " (whole segment)" : state.browsePath}`;
+  setMood("happy", `ok, next download: ${target}.`);
+  toast(`Download card set to ${target}. Pick a date and press Download.`, "good");
 });
 
 
-// --------------------------------------------------
+// ==========================================================
 // RUNS
-// --------------------------------------------------
+// ==========================================================
 
 function runScope(run) {
   let roots = [];
@@ -519,31 +631,49 @@ function runScope(run) {
   return roots.join(", ");
 }
 
+function runFailed(run) {
+  return (run.files_failed || 0) + (run.folders_failed || 0);
+}
+
+function renderRuns() {
+  const segment = $("#runsSegment").value;
+  const problemsOnly = $("#problemsOnly").checked;
+
+  const runs = state.runs.filter(run =>
+    (!segment || run.segment === segment) &&
+    (!problemsOnly || run.status !== "completed")
+  );
+
+  $("#runsCount").textContent = state.runs.length ? number(state.runs.length) : "";
+
+  $("#runs").innerHTML = runs.length ? runs.map(run => {
+    const failed = runFailed(run);
+    return `
+      <tr class="clickable ${run.id === state.selectedRun ? "selected" : ""}" data-run="${run.id}">
+        <td class="muted">${run.id}</td>
+        <td>${escapeHtml(run.exchange_date || "—")}</td>
+        <td><b>${escapeHtml(run.segment)}</b></td>
+        <td class="file-name">${escapeHtml(runScope(run))}${run.mode === "scheduled" ? '<span class="tag">scheduled</span>' : ""}</td>
+        <td><span class="badge ${escapeHtml(run.status)}">${escapeHtml(run.status)}</span></td>
+        <td class="num">${number(run.files_found)}</td>
+        <td class="num">${number(run.files_downloaded)}</td>
+        <td class="num">${number(run.files_skipped)}</td>
+        <td class="num" title="${escapeHtml(run.error_message || "")}">${failed ? `<b>${number(failed)}</b>` : "0"}</td>
+        <td class="muted" title="${escapeHtml(localTime(run.started_at))}">${escapeHtml(shortTime(run.started_at))}</td>
+        <td class="muted">${escapeHtml(duration(run.started_at, run.finished_at))}</td>
+      </tr>`;
+  }).join("") : `<tr><td colspan="11" class="empty-cell">${
+    state.runs.length ? "No runs match these filters." : "No runs yet. Your first download will show up here."
+  }</td></tr>`;
+}
+
 async function loadRuns() {
   try {
-    const data = await api("/api/runs?limit=30");
+    const data = await api("/api/runs?limit=200");
     state.runs = data.runs || [];
-
-    $("#runs").innerHTML = state.runs.length ? state.runs.map(run => {
-      const failed = (run.files_failed || 0) + (run.folders_failed || 0);
-      return `
-        <tr class="clickable ${run.id === state.selectedRun ? "selected" : ""}" data-run="${run.id}">
-          <td class="muted">${run.id}</td>
-          <td>${escapeHtml(run.exchange_date || "—")}</td>
-          <td><b>${escapeHtml(run.segment)}</b></td>
-          <td class="file-name">${escapeHtml(runScope(run))}${run.mode === "scheduled" ? '<span class="tag">scheduled</span>' : ""}</td>
-          <td><span class="badge ${escapeHtml(run.status)}">${escapeHtml(run.status)}</span></td>
-          <td class="num">${number(run.files_found)}</td>
-          <td class="num">${number(run.files_downloaded)}</td>
-          <td class="num">${number(run.files_skipped)}</td>
-          <td class="num" title="${escapeHtml(run.error_message || "")}">${failed ? `<b>${number(failed)}</b>` : "0"}</td>
-          <td class="muted">${escapeHtml(localTime(run.started_at))}</td>
-          <td class="muted">${escapeHtml(duration(run.started_at, run.finished_at))}</td>
-        </tr>`;
-    }).join("") : `<tr><td colspan="11" class="muted">No runs yet. Your first download will show up here.</td></tr>`;
-
+    renderRuns();
   } catch (error) {
-    $("#runs").innerHTML = `<tr><td colspan="11" class="note">${escapeHtml(error.message)}</td></tr>`;
+    $("#runs").innerHTML = `<tr><td colspan="11" class="empty-cell note">${escapeHtml(error.message)}</td></tr>`;
   }
 }
 
@@ -554,9 +684,8 @@ async function loadRunFiles() {
   const failedOnly = $("#failedOnly").checked;
   const query = `run_id=${run.id}&limit=500${failedOnly ? "&status=failed" : ""}`;
 
-  $("#runFiles").classList.remove("hidden");
   $("#runFilesTitle").textContent = `Run #${run.id} · ${run.segment} · ${run.exchange_date || ""}`;
-  $("#runFileRows").innerHTML = `<tr><td colspan="5" class="muted">Loading…</td></tr>`;
+  $("#runFileRows").innerHTML = `<tr><td colspan="5" class="empty-cell"><span class="spinner"></span>Loading files…</td></tr>`;
 
   try {
     const data = await api(`/api/downloads?${query}`);
@@ -564,6 +693,9 @@ async function loadRunFiles() {
 
     const folderNote = run.folders_failed
       ? `<tr><td colspan="5" class="note">${escapeHtml(run.error_message)}</td></tr>` : "";
+
+    $("#runFilesTitle").textContent =
+      `Run #${run.id} · ${run.segment} · ${run.exchange_date || ""} · ${files.length} file(s)`;
 
     $("#runFileRows").innerHTML = folderNote + (files.length ? files.map(f => `
       <tr>
@@ -573,12 +705,12 @@ async function loadRunFiles() {
         <td class="num">${escapeHtml(fileSize(f.file_size))}</td>
         <td class="note">${escapeHtml(f.error_message || "")}</td>
       </tr>`).join("")
-      : `<tr><td colspan="5" class="muted">${failedOnly
+      : `<tr><td colspan="5" class="empty-cell">${failedOnly
           ? "No failed files in this run."
           : "No files recorded for this run. Each file shows the latest run that processed it."}</td></tr>`);
 
   } catch (error) {
-    $("#runFileRows").innerHTML = `<tr><td colspan="5" class="note">${escapeHtml(error.message)}</td></tr>`;
+    $("#runFileRows").innerHTML = `<tr><td colspan="5" class="empty-cell note">${escapeHtml(error.message)}</td></tr>`;
   }
 }
 
@@ -587,17 +719,26 @@ $("#runs").addEventListener("click", (event) => {
   if (!row) return;
 
   state.selectedRun = Number(row.dataset.run);
-  document.querySelectorAll("#runs tr").forEach(tr => tr.classList.toggle("selected", tr === row));
+  $$("#runs tr").forEach(tr => tr.classList.toggle("selected", tr === row));
   loadRunFiles();
 });
 
 $("#failedOnly").addEventListener("change", loadRunFiles);
-$("#refreshRuns").addEventListener("click", loadRuns);
+$("#runsSegment").addEventListener("change", renderRuns);
+$("#problemsOnly").addEventListener("change", renderRuns);
+
+$("#refreshRuns").addEventListener("click", (event) =>
+  withLoading(event.currentTarget, "Refreshing…", async () => {
+    await loadRuns();
+    if (state.selectedRun) await loadRunFiles();
+    toast("Runs refreshed.", "info", 2000);
+  })
+);
 
 
-// --------------------------------------------------
+// ==========================================================
 // STATUS POLLING (scheduled runs, other tabs)
-// --------------------------------------------------
+// ==========================================================
 
 async function pollStatus() {
   let status;
@@ -605,13 +746,22 @@ async function pollStatus() {
   try {
     status = await api("/api/status");
   } catch {
+    $("#apiStatus").className = "pill down";
+    $("#apiStatus").innerHTML = "<i></i> App not reachable";
     return;
+  }
+
+  if ($("#apiStatus").classList.contains("down")) checkHealth();
+
+  if (status.server_time) {
+    state.serverOffsetMs = new Date(status.server_time) - Date.now();
+    state.timezone = status.timezone || "";
   }
 
   const wasRemote = state.remoteBusy;
   const remote = status.busy && !state.localBusy;
 
-  $("#busyBanner").classList.toggle("hidden", !status.busy || state.localBusy);
+  $("#busyBanner").classList.toggle("hidden", !remote);
 
   if (status.busy && status.current) {
     const label = status.current.kind === "scheduled" ? "Scheduled run" : "NSE in use";
@@ -626,8 +776,10 @@ async function pollStatus() {
       setMood("work", status.current.kind === "scheduled"
         ? "a scheduled run is fetching files…"
         : "someone else is using NSE right now…");
+      if (status.current.kind === "scheduled") toast(`Scheduled run started: ${status.current.description}`, "info");
     } else {
-      setMood("happy", "background run finished. see Runs below.");
+      setMood("happy", "background run finished. see Runs.");
+      toast("Background run finished. Runs updated.", "good");
       loadRuns();
     }
 
@@ -638,11 +790,9 @@ async function pollStatus() {
 }
 
 
-// --------------------------------------------------
+// ==========================================================
 // SCHEDULES
-// --------------------------------------------------
-
-const DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+// ==========================================================
 
 function describeDays(days) {
   const key = days.join(",");
@@ -653,25 +803,12 @@ function describeDays(days) {
 }
 
 function describeDates(daysBack) {
-  if (daysBack === 0) return "that day only";
-  return `that day + ${daysBack} day${daysBack > 1 ? "s" : ""} back`;
+  return daysBack === 0 ? "that day only" : `that day + ${daysBack} back`;
 }
 
 function describeRetries(s) {
   if (!s.retry_count) return "no retries";
-  return `${s.retry_count} retr${s.retry_count > 1 ? "ies" : "y"} every ${s.retry_delay_minutes} min`;
-}
-
-function relativeDay(iso) {
-  if (!iso) return "—";
-  const date = new Date(iso);
-  const today = new Date();
-  const tomorrow = new Date(); tomorrow.setDate(today.getDate() + 1);
-  const time = date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
-
-  if (date.toDateString() === today.toDateString()) return `today ${time}`;
-  if (date.toDateString() === tomorrow.toDateString()) return `tomorrow ${time}`;
-  return `${date.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" })} ${time}`;
+  return `${s.retry_count}× retry / ${s.retry_delay_minutes} min`;
 }
 
 function scheduleCard(s) {
@@ -692,28 +829,25 @@ function scheduleCard(s) {
 
   return `
     <div class="schedule ${s.enabled ? "" : "off"}" data-schedule="${s.id}">
-      <span class="switch" title="${s.enabled ? "Pause" : "Enable"} this schedule">
-        <input type="checkbox" data-action="toggle" ${s.enabled ? "checked" : ""}
-               aria-label="Enable ${escapeHtml(s.name)}">
-        <span></span>
-      </span>
-      <div>
-        <div class="when">
-          <span class="clock">${escapeHtml(s.time)}</span>
-          <b>${escapeHtml(s.name)}</b>
-          <span class="muted small">${escapeHtml(describeDays(s.days))} · ${next}</span>
+      <div class="top">
+        <span class="switch" title="${s.enabled ? "Pause" : "Enable"} this schedule">
+          <input type="checkbox" data-action="toggle" ${s.enabled ? "checked" : ""} aria-label="Enable ${escapeHtml(s.name)}">
+          <span></span>
+        </span>
+        <span class="clock">${escapeHtml(s.time)}</span>
+        <span class="name" title="${escapeHtml(s.name)}">${escapeHtml(s.name)}</span>
+        <div class="buttons">
+          <button type="button" class="secondary" data-action="run" ${s.queued ? "disabled" : ""} title="Run this schedule now">Run</button>
+          <button type="button" class="secondary" data-action="edit">Edit</button>
+          <button type="button" class="danger" data-action="delete" title="Delete schedule">✕</button>
         </div>
-        <div class="meta">
-          ${escapeHtml(s.segments.join(", "))} · ${escapeHtml(scope)} · ${escapeHtml(describeDates(s.days_back))}
-          · ${escapeHtml(describeRetries(s))} · catch-up ${s.catch_up ? "on" : "off"}
-        </div>
-        <div class="last">${last}</div>
       </div>
-      <div class="buttons">
-        <button type="button" class="secondary" data-action="run" ${s.queued ? "disabled" : ""}>Run now</button>
-        <button type="button" class="secondary" data-action="edit">Edit</button>
-        <button type="button" class="danger" data-action="delete">Delete</button>
+      <div class="meta">
+        ${escapeHtml(describeDays(s.days))} · ${escapeHtml(s.segments.join(", "))} · ${escapeHtml(scope)}<br>
+        ${escapeHtml(describeDates(s.days_back))} · ${escapeHtml(describeRetries(s))} · catch-up ${s.catch_up ? "on" : "off"}
       </div>
+      <div class="next">${next}</div>
+      <div class="last">${last}</div>
     </div>`;
 }
 
@@ -723,15 +857,15 @@ async function loadSchedules() {
     state.schedules = data.schedules || [];
     state.defaults = data.defaults;
 
-    $("#clock").textContent =
-      `Times use this computer's clock (${data.timezone}). ` +
-      (data.scheduler_running ? "Scheduler is running." : "Scheduler is off (NSE_SCHEDULER=off).");
+    $("#schedulerInfo").textContent = data.scheduler_running
+      ? `Scheduler running · ${data.timezone}`
+      : "Scheduler is off (NSE_SCHEDULER=off)";
 
     $("#scheduleList").innerHTML = state.schedules.length
       ? state.schedules.map(scheduleCard).join("")
       : `<div class="empty">
            <pre aria-hidden="true">${escapeHtml(cat("( -.- )", ["", " z", ""]))}</pre>
-           <span>No schedules yet. Add one and the files arrive on their own, for example every weekday at 23:00.</span>
+           <span>No schedules yet. Press <b>+ Add</b> and files arrive on their own, for example every weekday at 23:00.</span>
          </div>`;
 
   } catch (error) {
@@ -741,31 +875,22 @@ async function loadSchedules() {
 
 function schedulePayload(s, overrides = {}) {
   return {
-    name: s.name,
-    enabled: s.enabled,
-    time: s.time,
-    days: s.days,
-    segments: s.segments,
-    scope: s.scope,
-    folders: s.folders,
-    days_back: s.days_back,
-    retry_count: s.retry_count,
-    retry_delay_minutes: s.retry_delay_minutes,
-    catch_up: s.catch_up,
+    name: s.name, enabled: s.enabled, time: s.time, days: s.days,
+    segments: s.segments, scope: s.scope, folders: s.folders,
+    days_back: s.days_back, retry_count: s.retry_count,
+    retry_delay_minutes: s.retry_delay_minutes, catch_up: s.catch_up,
     ...overrides,
   };
 }
 
-async function saveSchedule(id, payload) {
-  return id
-    ? api(`/api/schedules/${id}`, payload, "PUT")
-    : api("/api/schedules", payload);
+function saveSchedule(id, payload) {
+  return id ? api(`/api/schedules/${id}`, payload, "PUT") : api("/api/schedules", payload);
 }
 
 $("#scheduleList").addEventListener("click", async (event) => {
-  const button = event.target.closest("[data-action]");
+  const button = event.target.closest("button[data-action]");
   const card = event.target.closest("[data-schedule]");
-  if (!button || !card || button.dataset.action === "toggle") return;
+  if (!button || !card) return;
 
   const schedule = state.schedules.find(s => s.id === Number(card.dataset.schedule));
   if (!schedule) return;
@@ -776,25 +901,31 @@ $("#scheduleList").addEventListener("click", async (event) => {
     openScheduleDialog(schedule);
 
   } else if (action === "delete") {
-    if (!window.confirm(`Delete the schedule "${schedule.name}"? Past runs stay in the history.`)) return;
-    try {
-      await api(`/api/schedules/${schedule.id}`, undefined, "DELETE");
-      setMood("sleep", `deleted "${schedule.name}".`);
-    } catch (error) {
-      setMood("worried", error.message);
-    }
+    if (!window.confirm(`Delete the schedule "${schedule.name}"?\nPast runs stay in the history.`)) return;
+
+    await withLoading(button, "…", async () => {
+      try {
+        await api(`/api/schedules/${schedule.id}`, undefined, "DELETE");
+        toast(`Deleted "${schedule.name}".`, "info");
+        setMood("sleep", `deleted "${schedule.name}".`);
+      } catch (error) {
+        toast(error.message, "bad");
+      }
+    });
     loadSchedules();
 
   } else if (action === "run") {
-    button.disabled = true;
-    try {
-      await api(`/api/schedules/${schedule.id}/run`, {});
-      setMood("work", `queued "${schedule.name}". it starts as soon as NSE is free.`);
-    } catch (error) {
-      setMood("worried", error.message);
-    }
+    await withLoading(button, "Queuing…", async () => {
+      try {
+        await api(`/api/schedules/${schedule.id}/run`, {});
+        toast(`"${schedule.name}" queued. It starts as soon as NSE is free.`, "good");
+        setMood("work", `queued "${schedule.name}"…`);
+      } catch (error) {
+        toast(error.message, error.status === 409 ? "warn" : "bad");
+      }
+    });
     loadSchedules();
-    setTimeout(pollStatus, 800);
+    setTimeout(pollStatus, 700);
   }
 });
 
@@ -804,14 +935,15 @@ $("#scheduleList").addEventListener("change", async (event) => {
   if (!toggle || !card) return;
 
   const schedule = state.schedules.find(s => s.id === Number(card.dataset.schedule));
+  toggle.disabled = true;
 
   try {
     await saveSchedule(schedule.id, schedulePayload(schedule, { enabled: toggle.checked }));
-    setMood(toggle.checked ? "happy" : "sleep",
-      toggle.checked ? `"${schedule.name}" is on.` : `"${schedule.name}" is paused.`);
+    toast(toggle.checked ? `"${schedule.name}" is on.` : `"${schedule.name}" is paused.`, toggle.checked ? "good" : "info");
+    setMood(toggle.checked ? "happy" : "sleep", toggle.checked ? `"${schedule.name}" is on.` : `"${schedule.name}" paused.`);
   } catch (error) {
     toggle.checked = !toggle.checked;
-    setMood("worried", error.message);
+    toast(error.message, "bad");
   }
 
   loadSchedules();
@@ -820,35 +952,28 @@ $("#scheduleList").addEventListener("change", async (event) => {
 
 // ---------- editor dialog ----------
 
-const editor = {
-  days: new Set(),
-  segments: new Set(),
-};
+const editor = { days: new Set(), segments: new Set() };
 
 function fillSelect(select, options, value) {
-  select.innerHTML = options
-    .map(([v, label]) => `<option value="${v}">${escapeHtml(label)}</option>`)
-    .join("");
+  select.innerHTML = options.map(([v, label]) => `<option value="${v}">${escapeHtml(label)}</option>`).join("");
   select.value = String(value);
-}
-
-function renderEditorChips() {
-  $("#sDays").innerHTML = DAY_NAMES.map((name, i) => `
-    <button type="button" class="chip" data-day-index="${i}"
-            aria-pressed="${editor.days.has(i)}">${name}</button>`).join("");
-
-  const allOn = state.segments.every(s => editor.segments.has(s));
-  $("#sSegments").innerHTML =
-    state.segments.map(s => `
-      <button type="button" class="chip" data-seg="${escapeHtml(s)}"
-              aria-pressed="${editor.segments.has(s)}">${escapeHtml(s)}</button>`).join("") +
-    `<button type="button" class="chip" data-seg="*" aria-pressed="${allOn}">All</button>`;
-
-  updateHint();
 }
 
 function editorScope() {
   return document.querySelector("input[name='sScope']:checked").value;
+}
+
+function renderEditorChips() {
+  $("#sDays").innerHTML = DAY_NAMES.map((name, i) => `
+    <button type="button" class="chip" data-day-index="${i}" aria-pressed="${editor.days.has(i)}">${name}</button>`).join("");
+
+  const allOn = state.segments.every(s => editor.segments.has(s));
+  $("#sSegments").innerHTML =
+    state.segments.map(s => `
+      <button type="button" class="chip" data-seg="${escapeHtml(s)}" aria-pressed="${editor.segments.has(s)}">${escapeHtml(s)}</button>`).join("") +
+    `<button type="button" class="chip" data-seg="*" aria-pressed="${allOn}">All</button>`;
+
+  updateHint();
 }
 
 function updateHint() {
@@ -859,12 +984,7 @@ function updateHint() {
 
   $("#sFoldersWrap").classList.toggle("hidden", editorScope() !== "folder");
 
-  if (!days.length || !segs.length) {
-    $("#sHint").textContent = "";
-    return;
-  }
-
-  $("#sHint").textContent =
+  $("#sHint").textContent = (!days.length || !segs.length) ? "" :
     `${describeDays(days)} at ${time}: download ${segs.join(", ")} ` +
     `for ${back ? `that day and the ${back} day${back > 1 ? "s" : ""} before` : "that day"}. ` +
     "Files already downloaded are skipped, so re-checking earlier days is cheap and catches late uploads.";
@@ -889,11 +1009,9 @@ function openScheduleDialog(schedule = null) {
   document.querySelector(`input[name='sScope'][value='${s.scope}']`).checked = true;
 
   fillSelect($("#sDaysBack"),
-    [0, 1, 2, 3, 4, 5, 6, 7].map(n => [n, n === 0 ? "That day only" : `That day + ${n} back`]),
-    s.days_back);
+    [0, 1, 2, 3, 4, 5, 6, 7].map(n => [n, n === 0 ? "That day only" : `That day + ${n} back`]), s.days_back);
   fillSelect($("#sRetries"),
-    [0, 1, 2, 3, 4, 5].map(n => [n, n === 0 ? "No retries" : `${n} time${n > 1 ? "s" : ""}`]),
-    s.retry_count);
+    [0, 1, 2, 3, 4, 5].map(n => [n, n === 0 ? "No retries" : `${n} time${n > 1 ? "s" : ""}`]), s.retry_count);
   fillSelect($("#sRetryDelay"),
     [5, 10, 15, 30, 60, 120].map(n => [n, n < 60 ? `${n} minutes` : `${n / 60} hour${n > 60 ? "s" : ""}`]),
     [5, 10, 15, 30, 60, 120].includes(s.retry_delay_minutes) ? s.retry_delay_minutes : 15);
@@ -915,7 +1033,7 @@ $("#sDays").addEventListener("click", (event) => {
   renderEditorChips();
 });
 
-document.querySelectorAll("[data-days]").forEach(button => {
+$$("[data-days]").forEach(button => {
   button.addEventListener("click", () => {
     editor.days = new Set(button.dataset.days === "weekdays" ? [0, 1, 2, 3, 4] : [0, 1, 2, 3, 4, 5, 6]);
     renderEditorChips();
@@ -937,7 +1055,7 @@ $("#sSegments").addEventListener("click", (event) => {
 });
 
 ["#sTime", "#sDaysBack"].forEach(id => $(id).addEventListener("input", updateHint));
-document.querySelectorAll("input[name='sScope']").forEach(r => r.addEventListener("change", updateHint));
+$$("input[name='sScope']").forEach(r => r.addEventListener("change", updateHint));
 
 $("#scheduleForm").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -958,30 +1076,37 @@ $("#scheduleForm").addEventListener("submit", async (event) => {
     catch_up: $("#sCatchUp").checked,
   };
 
-  $("#sSave").disabled = true;
+  $("#sError").textContent = "";
 
-  try {
-    await saveSchedule(state.editingId, payload);
-    $("#scheduleDialog").close();
-    setMood("happy", `saved "${payload.name}". I'll wake up at ${payload.time}.`);
-    loadSchedules();
-  } catch (error) {
-    $("#sError").textContent = error.message;
-  } finally {
-    $("#sSave").disabled = false;
-  }
+  await withLoading($("#sSave"), "Saving…", async () => {
+    try {
+      await saveSchedule(state.editingId, payload);
+      $("#scheduleDialog").close();
+      toast(`Saved "${payload.name}" (${describeDays(payload.days)} at ${payload.time}).`, "good");
+      setMood("happy", `saved. I'll wake up at ${payload.time}.`);
+      loadSchedules();
+    } catch (error) {
+      $("#sError").textContent = error.message;
+    }
+  });
 });
 
 
-// --------------------------------------------------
+// ==========================================================
 // START
-// --------------------------------------------------
+// ==========================================================
 
 setMood("sleep", "zzz… pick a date and segments, I'll fetch the files.");
 renderCrumbs("/");
 checkHealth();
-loadSegments().then(loadSchedules);
+loadSegments().then(() => {
+  loadSchedules();
+  showTab(store.get("tab", "runs"));
+});
 loadRuns();
 pollStatus();
+tickClock();
+
 setInterval(pollStatus, 4000);
+setInterval(tickClock, 1000);
 setInterval(() => { if (!state.busy) loadSchedules(); }, 60000);

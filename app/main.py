@@ -149,9 +149,19 @@ def validate_folder_request(payload: dict):
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
-    return (
-        BASE_DIR / "templates" / "index.html"
-    ).read_text(encoding="utf-8")
+    """
+    Serve the page with versioned asset links (?v=<file modified time>),
+    so the browser fetches new CSS/JS after an update instead of using
+    an old cached copy.
+    """
+
+    html = (BASE_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+
+    for asset in ("style.css", "app.js"):
+        version = int((BASE_DIR / "static" / asset).stat().st_mtime)
+        html = html.replace(f"/static/{asset}\"", f"/static/{asset}?v={version}\"")
+
+    return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/health")
