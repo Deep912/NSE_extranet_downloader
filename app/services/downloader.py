@@ -77,6 +77,19 @@ class DownloaderService:
             return ""
 
         return "/".join(parts) + "/"
+
+    @staticmethod
+    def _api_path(folder_path: str) -> str:
+        """
+        Convert an internal folder path into the form sent to NSE.
+
+        Internally, folder paths have no leading slash and end with a
+        slash ("Reports/Order_Reports/"); the segment root is "".
+        NSE expects "/Reports/Order_Reports" and "/" for the root.
+        """
+
+        return "/" + folder_path.strip("/")
+
     @staticmethod
     def _normalise_root_name(root_name: str) -> str:
         """Accept one root folder name, not a nested path."""
@@ -386,7 +399,7 @@ class DownloaderService:
                     try:
                         listing = client.list_content(
                             segment=segment,
-                            folder_path=current_path,
+                            folder_path=self._api_path(current_path),
                         )
 
                         items = listing.get("data", [])
@@ -441,12 +454,8 @@ class DownloaderService:
                             continue
 
                         if item_type == "folder":
-                            child_path = (
-                                current_path.rstrip("/")
-                                + "/"
-                                + name
-                                + "/"
-                            )
+                            # current_path is "" (root) or ends with "/".
+                            child_path = f"{current_path}{name}/"
 
                             child_folders.append(child_path)
 
@@ -502,7 +511,7 @@ class DownloaderService:
                         try:
                             file_bytes = client.download_single_file(
                                 segment=segment,
-                                folder_path=current_path,
+                                folder_path=self._api_path(current_path),
                                 filename=filename,
                             )
 
@@ -605,7 +614,7 @@ class DownloaderService:
         return self._process_paths(
             segment=segment,
             selected_paths=[
-                (folder_path.strip("/"), folder_path)
+                (folder_path.strip("/") or "/", folder_path)
             ],
             exchange_date=date,
         )
@@ -632,7 +641,7 @@ class DownloaderService:
         ))
 
         selected_paths = [
-            (root_name, f"/{root_name}/")
+            (root_name, f"{root_name}/")
             for root_name in selected_roots
         ]
 
