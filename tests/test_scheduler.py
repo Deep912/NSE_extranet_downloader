@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from app.database import init_db
 from app.services.download_history import DownloadHistory
 from app.services.nse_activity import NSEActivity, NSEBusyError
+from app.services.folder_lists import FolderListStore
 from app.services.scheduler import ScheduleStore, Scheduler
 
 
@@ -19,8 +20,8 @@ class FakeDownloader:
         self.calls = []
         self.failing_segments = set()
 
-    def download_folder(self, segment, folder_path, date, mode="folder"):
-        self.calls.append((segment, folder_path, date, mode))
+    def download_folders(self, segment, folder_paths, date, mode="list"):
+        self.calls.append((segment, list(folder_paths), date, mode))
 
         if segment in self.failing_segments:
             return {"run_id": len(self.calls), "downloaded": 0,
@@ -141,10 +142,10 @@ def test_due_schedule_is_queued_once_and_covers_days_back(env):
 
     assert job["kind"] == "scheduled"
     assert downloader.calls == [
-        ("CM", "/", "16-11-2026", "scheduled"),
-        ("FO", "/", "16-11-2026", "scheduled"),
-        ("CM", "/", "17-11-2026", "scheduled"),
-        ("FO", "/", "17-11-2026", "scheduled"),
+        ("CM", ["/"], "16-11-2026", "scheduled"),
+        ("FO", ["/"], "16-11-2026", "scheduled"),
+        ("CM", ["/"], "17-11-2026", "scheduled"),
+        ("FO", ["/"], "17-11-2026", "scheduled"),
     ]
     assert result["status"] == "completed"
 
@@ -155,7 +156,7 @@ def test_due_schedule_is_queued_once_and_covers_days_back(env):
     assert "4 new" in saved["last_summary"]
 
 
-def test_folder_scope_runs_each_folder(env):
+def test_folder_scope_runs_all_folders_in_one_run(env):
     store, scheduler, downloader, clock, _ = env
     store.create(nightly(scope="folder", folders=["/Reports", "/Onlinebackup"], days_back=0), clock())
 
@@ -163,9 +164,30 @@ def test_folder_scope_runs_each_folder(env):
     scheduler.tick()
     drain(scheduler)
 
-    assert [(c[1], c[2]) for c in downloader.calls] == [
-        ("/Reports", "17-11-2026"), ("/Onlinebackup", "17-11-2026"),
+    assert downloader.calls == [
+        ("CM", ["/Reports", "/Onlinebackup"], "17-11-2026", "scheduled"),
     ]
+
+
+def test_list_scope_uses_saved_folder_lists(env):
+    store, scheduler, downloader, clock, database_path = env
+    lists = FolderListStore(database_path)
+    lists.add("CM", "/Accounts")
+    lists.add("CM", "/Reports")
+    scheduler.folder_lists = lists
+
+    schedule = store.create(nightly(scope="list", segments=["CM", "FO"], days_back=0), clock())
+
+    clock.value = TUESDAY_2200.replace(hour=23)
+    scheduler.tick()
+    drain(scheduler)
+
+    # CM uses its list; FO's list is empty, so that part fails clearly.
+    assert downloader.calls == [("CM", ["/Accounts", "/Reports"], "17-11-2026", "scheduled")]
+
+    saved = store.get(schedule["id"])
+    assert saved["last_status"] == "partial"
+    assert "folder list for FO is empty" in saved["last_summary"]
 
 
 def test_missed_run_without_catch_up_is_recorded_as_missed(env):

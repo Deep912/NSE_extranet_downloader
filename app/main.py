@@ -1,17 +1,20 @@
 
 import os
+import time
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.config import settings, DOWNLOAD_ROOTS
 from app.database import init_db, get_connection
+from app.services.admin_auth import AdminAuth
 from app.services.downloader import DownloaderService
 from app.services.folder_catalogue_service import FolderCatalogueService
+from app.services.folder_lists import FolderListStore
 from app.services.nse_activity import NSEBusyError, activity
 from app.services.nse_client import NSEExtranetClient, NSEAPIError
 from app.services.scheduler import (
@@ -27,7 +30,9 @@ BASE_DIR = Path(__file__).resolve().parent
 downloader = DownloaderService()
 catalogue_service = FolderCatalogueService()
 schedule_store = ScheduleStore()
-scheduler = Scheduler(schedule_store, downloader, activity)
+folder_lists = FolderListStore()
+admin = AdminAuth(settings.admin_password)
+scheduler = Scheduler(schedule_store, downloader, activity, folder_lists=folder_lists)
 
 SUPPORTED_SEGMENTS = {"CM", "FO", "CD", "CO", "SLB"}
 
@@ -37,6 +42,9 @@ DOWNLOAD_STATUSES = {"downloaded", "already_downloaded", "failed"}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+
+    # First start only: fill the folder lists from DOWNLOAD_ROOTS in config.py.
+    folder_lists.seed_once(DOWNLOAD_ROOTS)
 
     # Set NSE_SCHEDULER=off to run without the background scheduler
     # (for example in tests). Run uvicorn with a single worker, otherwise
@@ -65,6 +73,16 @@ def nse_session(description: str):
             yield
     except NSEBusyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+def require_admin(request: Request) -> None:
+    """Changing schedules and folder lists needs the admin (if one is set)."""
+
+    if not admin.allowed(request.cookies.get(AdminAuth.COOKIE_NAME)):
+        raise HTTPException(
+            status_code=401,
+            detail="Only the admin can change this. Log in as admin first.",
+        )
 
 
 app = FastAPI(
@@ -660,7 +678,9 @@ def list_schedules():
 
 
 @app.post("/api/schedules", status_code=201)
-def create_schedule(payload: dict):
+def create_schedule(payload: dict, request: Request):
+    require_admin(request)
+
     try:
         schedule = schedule_store.create(payload, datetime.now())
     except ValueError as exc:
@@ -670,7 +690,8 @@ def create_schedule(payload: dict):
 
 
 @app.put("/api/schedules/{schedule_id}")
-def update_schedule(schedule_id: int, payload: dict):
+def update_schedule(schedule_id: int, payload: dict, request: Request):
+    require_admin(request)
     _schedule_or_404(schedule_id)
 
     try:
@@ -682,7 +703,8 @@ def update_schedule(schedule_id: int, payload: dict):
 
 
 @app.delete("/api/schedules/{schedule_id}")
-def delete_schedule(schedule_id: int):
+def delete_schedule(schedule_id: int, request: Request):
+    require_admin(request)
     _schedule_or_404(schedule_id)
     schedule_store.delete(schedule_id)
     return {"deleted": schedule_id}
@@ -707,3 +729,165 @@ def run_schedule_now(schedule_id: int):
         )
 
     return scheduler.describe(schedule_store.get(schedule_id))
+
+
+# --------------------------------------------------
+# ADMIN LOGIN
+# --------------------------------------------------
+
+@app.get("/api/admin")
+def admin_status(request: Request):
+    token = request.cookies.get(AdminAuth.COOKIE_NAME)
+
+    return {
+        "configured": admin.configured,
+        "is_admin": admin.is_admin(token),
+        # True when this browser may change schedules and folder lists.
+        "can_edit": admin.allowed(token),
+    }
+
+
+@app.post("/api/admin/login")
+def admin_login(payload: dict):
+    if not admin.configured:
+        raise HTTPException(
+            status_code=400,
+            detail="No admin password is set. Add ADMIN_PASSWORD to the .env file and restart.",
+        )
+
+    token = admin.login(str(payload.get("password", "")))
+
+    if token is None:
+        time.sleep(1)  # slow down password guessing
+        raise HTTPException(status_code=401, detail="Wrong password.")
+
+    response = JSONResponse({"is_admin": True, "can_edit": True})
+    response.set_cookie(
+        AdminAuth.COOKIE_NAME,
+        token,
+        max_age=AdminAuth.SESSION_SECONDS,
+        httponly=True,
+        samesite="strict",
+    )
+    return response
+
+
+@app.post("/api/admin/logout")
+def admin_logout(request: Request):
+    admin.logout(request.cookies.get(AdminAuth.COOKIE_NAME))
+
+    response = JSONResponse({"is_admin": False, "can_edit": not admin.configured})
+    response.delete_cookie(AdminAuth.COOKIE_NAME)
+    return response
+
+
+# --------------------------------------------------
+# SAVED FOLDER LISTS
+# --------------------------------------------------
+
+@app.get("/api/folder-lists")
+def get_folder_lists(request: Request):
+    return {
+        "lists": folder_lists.all(),
+        "can_edit": admin.allowed(request.cookies.get(AdminAuth.COOKIE_NAME)),
+    }
+
+
+@app.post("/api/folder-lists")
+def add_to_folder_list(payload: dict, request: Request):
+    require_admin(request)
+
+    try:
+        folders = folder_lists.add(payload.get("segment"), payload.get("folder_path"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {"segment": str(payload.get("segment")).upper(), "folders": folders}
+
+
+@app.delete("/api/folder-lists")
+def remove_from_folder_list(segment: str, folder_path: str, request: Request):
+    require_admin(request)
+
+    try:
+        folders = folder_lists.remove(segment, folder_path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {"segment": segment.upper(), "folders": folders}
+
+
+@app.post("/api/nse/download-list")
+def nse_download_list(payload: dict):
+    """Download one date for every folder in a segment's saved list (one run)."""
+
+    segment = validate_segment(payload.get("segment", "CM"))
+    date = validate_date(payload.get("date", ""))
+    folders = folder_lists.get(segment)
+
+    if not folders:
+        raise HTTPException(
+            status_code=400,
+            detail=f"The folder list for {segment} is empty. Add folders from the Browse NSE tab.",
+        )
+
+    try:
+        with nse_session(f"Manual download {segment} folder list {date}"):
+            return downloader.download_folders(segment, folders, date, mode="list")
+
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    except NSEAPIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not save downloaded files: {exc}") from exc
+
+
+# --------------------------------------------------
+# SINGLE FILES
+# --------------------------------------------------
+
+@app.post("/api/nse/download-file")
+def nse_download_file(payload: dict):
+    """Download one file chosen in the Browse view."""
+
+    segment = validate_segment(payload.get("segment", "CM"))
+    folder_path = str(payload.get("folder_path") or "/")
+    file_name = str(payload.get("file_name") or "")
+
+    try:
+        with nse_session(f"Downloading {file_name}"):
+            return downloader.download_file(segment, folder_path, file_name)
+
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    except NSEAPIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not save the file: {exc}") from exc
+
+
+@app.get("/api/downloads/{download_id}/file")
+def get_downloaded_file(download_id: int):
+    """Send a downloaded file to the browser ("Save copy")."""
+
+    row = downloader.history.get_file_record(download_id)
+
+    if row is None or not row["local_path"]:
+        raise HTTPException(status_code=404, detail="No saved file for this record.")
+
+    root = downloader.download_root.resolve()
+    path = Path(row["local_path"]).resolve()
+
+    # Only serve files inside the download folder.
+    if not path.is_relative_to(root) or not path.is_file():
+        raise HTTPException(status_code=404, detail="The saved file is missing.")
+
+    return FileResponse(path, filename=path.name, media_type="application/octet-stream")

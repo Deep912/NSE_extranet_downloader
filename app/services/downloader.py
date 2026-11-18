@@ -749,6 +749,177 @@ class DownloaderService:
             mode=mode,
         )
 
+    def download_folders(
+        self,
+        segment: str,
+        folder_paths: list[str],
+        date: str,
+        mode: str = "list",
+    ) -> dict:
+        """
+        Recursively download matching files from several folders as one run.
+
+        A folder inside another selected folder is skipped, since walking
+        the outer folder already covers it.
+        """
+
+        segment = self._validate_segment(segment)
+        date = self._validate_date(date)
+
+        if not isinstance(folder_paths, list) or not folder_paths:
+            raise ValueError(f"No folders selected for {segment}.")
+
+        paths = list(dict.fromkeys(
+            self._validate_folder_path(path) for path in folder_paths
+        ))
+
+        # "" is the segment root and covers everything.
+        paths = [
+            path for path in paths
+            if not any(other != path and path.startswith(other) for other in paths)
+        ]
+
+        return self._process_paths(
+            segment=segment,
+            selected_paths=[(path.strip("/") or "/", path) for path in paths],
+            exchange_date=date,
+            mode=mode,
+        )
+
+    def download_file(
+        self,
+        segment: str,
+        folder_path: str,
+        filename: str,
+    ) -> dict:
+        """
+        Download one file on request, e.g. from the Browse view.
+
+        The file is dated by its own NSE lastUpdated (UTC), saved in the
+        usual folder structure and recorded as a run with mode "file".
+        Raises FileNotFoundError if the folder does not list the file.
+        """
+
+        segment = self._validate_segment(segment)
+        folder_path = self._validate_folder_path(folder_path or "/")
+
+        if (
+            not isinstance(filename, str)
+            or not filename.strip()
+            or filename in {".", ".."}
+            or "/" in filename
+            or "\\" in filename
+        ):
+            raise ValueError("Invalid file name.")
+
+        api_path = self._api_path(folder_path)
+
+        with self.client_factory() as client:
+            listing = client.list_content(segment=segment, folder_path=api_path)
+            items = listing.get("data", []) if isinstance(listing, dict) else []
+
+            item = next(
+                (
+                    i for i in items
+                    if isinstance(i, dict)
+                    and i.get("name") == filename
+                    and str(i.get("type", "")).lower() == "file"
+                ),
+                None,
+            )
+
+            if item is None:
+                raise FileNotFoundError(
+                    f"{filename} was not found in {segment}{api_path}."
+                )
+
+            file_date = self._get_file_date(item)
+
+            if file_date is None:
+                raise ValueError(
+                    f"NSE did not give an upload date for {filename}."
+                )
+
+            exchange_date = file_date.strftime("%d-%m-%Y")
+            nse_last_updated = item.get("lastUpdated")
+
+            run_id = self.history.start_run(
+                segment=segment,
+                exchange_date=exchange_date,
+                mode="file",
+                roots=[f"{api_path.rstrip('/')}/{filename}"],
+            )
+
+            try:
+                file_bytes = client.download_single_file(
+                    segment=segment,
+                    folder_path=api_path,
+                    filename=filename,
+                )
+
+                saved = self._save_file(
+                    segment=segment,
+                    folder_path=folder_path,
+                    filename=filename,
+                    file_bytes=file_bytes,
+                    exchange_date=exchange_date,
+                )
+
+                self.history.record_file(
+                    run_id=run_id,
+                    segment=segment,
+                    exchange_date=exchange_date,
+                    folder_path=folder_path,
+                    file_name=filename,
+                    status=saved["status"],
+                    nse_last_updated=nse_last_updated,
+                    local_path=saved["file_path"],
+                    file_size=saved["file_size"],
+                    sha256=saved["sha256"],
+                )
+
+            except Exception as exc:
+                self.history.record_file(
+                    run_id=run_id,
+                    segment=segment,
+                    exchange_date=exchange_date,
+                    folder_path=folder_path,
+                    file_name=filename,
+                    status="failed",
+                    nse_last_updated=nse_last_updated,
+                    error_message=str(exc),
+                )
+                self.history.finish_run(
+                    run_id,
+                    status="failed",
+                    files_found=1,
+                    files_failed=1,
+                    error_message=str(exc),
+                )
+                raise
+
+        downloaded = saved["status"] == "downloaded"
+
+        self.history.finish_run(
+            run_id,
+            status="completed",
+            files_found=1,
+            files_downloaded=1 if downloaded else 0,
+            files_skipped=0 if downloaded else 1,
+        )
+
+        print(
+            f"[NSE] Single file {segment}{api_path}/{filename}: {saved['status']}",
+            flush=True,
+        )
+
+        return {
+            "run_id": run_id,
+            "segment": segment,
+            "exchange_date": exchange_date,
+            **saved,
+        }
+
     def download_root_folders(
         self,
         segment: str,

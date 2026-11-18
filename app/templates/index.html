@@ -19,6 +19,7 @@
       <div class="top-pills">
         <span class="pill" id="apiStatus"><i></i> Connecting…</span>
         <span class="pill" id="clockPill" title="This computer's clock, used by schedules">--:--</span>
+        <button type="button" class="pill pill-btn" id="adminBtn">Admin</button>
       </div>
 
       <figure class="mascot" aria-live="polite">
@@ -61,10 +62,16 @@
               <span>Whole segment</span>
             </label>
             <label class="seg-option">
+              <input type="radio" name="scope" value="list">
+              <span>Folder list</span>
+            </label>
+            <label class="seg-option">
               <input type="radio" name="scope" value="folder">
               <span>One folder</span>
             </label>
           </div>
+
+          <div id="listScope" class="list-summary hidden"></div>
 
           <div id="folderScope" class="hidden">
             <label for="scopeFolder">Folder path <span class="muted">(subfolders included)</span></label>
@@ -158,16 +165,27 @@
 
           <nav class="crumbs" id="crumbs" aria-label="Folder path"></nav>
 
-          <div class="table-wrap scroll fill">
-            <table>
-              <thead><tr><th>Name</th><th>Last updated</th></tr></thead>
-              <tbody id="browseItems">
-                <tr><td colspan="2" class="empty-cell">Pick a segment and press Open.</td></tr>
-              </tbody>
-            </table>
+          <div class="browse-body">
+            <div class="table-wrap scroll">
+              <table>
+                <thead><tr><th>Name</th><th>Last updated</th><th class="num"></th></tr></thead>
+                <tbody id="browseItems">
+                  <tr><td colspan="3" class="empty-cell">Pick a segment and press Open.</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <aside class="list-panel">
+              <div class="pane-head">
+                <h3 id="listTitle">Folder list</h3>
+                <button type="button" class="secondary small-btn" id="addCurrentFolder" title="Add the open folder to this segment's list">+ This folder</button>
+              </div>
+              <p class="muted small" id="listHelp">Folders used by the “Folder list” scope in downloads and schedules. Subfolders are included.</p>
+              <ul class="list-items scroll" id="listItems"></ul>
+            </aside>
           </div>
 
-          <p class="muted small" id="browseInfo">Read-only. One NSE login at a time, so browsing waits while a download runs.</p>
+          <p class="muted small" id="browseInfo">One NSE login at a time, so browsing waits while a download runs.</p>
         </div>
       </section>
     </main>
@@ -215,10 +233,16 @@
           <span>Whole segment</span>
         </label>
         <label class="seg-option">
+          <input type="radio" name="sScope" value="list">
+          <span>Folder list</span>
+        </label>
+        <label class="seg-option">
           <input type="radio" name="sScope" value="folder">
           <span>Specific folders</span>
         </label>
       </div>
+
+      <p id="sListInfo" class="muted small hidden"></p>
 
       <div id="sFoldersWrap" class="hidden">
         <label for="sFolders">Folders (one per line, subfolders included)</label>
@@ -251,6 +275,21 @@
       <div class="actions end">
         <button type="button" class="secondary" id="sCancel">Cancel</button>
         <button type="submit" class="primary" id="sSave">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Admin login -->
+  <dialog id="adminDialog" class="small-dialog" aria-labelledby="adminDialogTitle">
+    <form id="adminForm" method="dialog" novalidate>
+      <h2 id="adminDialogTitle">Admin login</h2>
+      <p class="muted small">Only the admin can add, edit, pause or delete schedules and change folder lists.</p>
+      <label for="adminPassword">Password</label>
+      <input id="adminPassword" type="password" autocomplete="current-password">
+      <p class="form-error" id="adminError" role="alert"></p>
+      <div class="actions end">
+        <button type="button" class="secondary" id="adminCancel">Cancel</button>
+        <button type="submit" class="primary" id="adminSubmit">Log in</button>
       </div>
     </form>
   </dialog>

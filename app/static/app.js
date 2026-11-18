@@ -232,6 +232,11 @@ const state = {
   editingId: null,
   serverOffsetMs: 0,
   timezone: "",
+  lists: {},              // saved folder lists per segment
+  canEdit: true,          // may change schedules + folder lists
+  adminConfigured: false,
+  isAdmin: false,
+  browseItems: [],
 };
 
 // Controls that need NSE are disabled while anything else uses it.
@@ -246,6 +251,196 @@ function applyBusy() {
     if (!element.classList.contains("loading")) element.disabled = busy;
   });
 }
+
+
+// ==========================================================
+// ADMIN
+// ==========================================================
+
+function renderAdmin() {
+  const button = $("#adminBtn");
+
+  button.classList.toggle("admin-on", state.isAdmin);
+  button.disabled = !state.adminConfigured;
+
+  if (!state.adminConfigured) {
+    button.textContent = "No admin set";
+    button.title = "Set ADMIN_PASSWORD in the .env file and restart to protect schedules.";
+  } else if (state.isAdmin) {
+    button.textContent = "Admin ✓ · Log out";
+    button.title = "You can change schedules and folder lists.";
+  } else {
+    button.textContent = "Admin login";
+    button.title = "Log in to change schedules and folder lists.";
+  }
+
+  $("#addSchedule").disabled = !state.canEdit;
+  $("#addSchedule").title = state.canEdit ? "" : "Only the admin can add schedules.";
+}
+
+async function loadAdmin() {
+  try {
+    const data = await api("/api/admin");
+    state.adminConfigured = data.configured;
+    state.isAdmin = data.is_admin;
+    state.canEdit = data.can_edit;
+  } catch {
+    // keep previous values
+  }
+
+  renderAdmin();
+}
+
+// Refresh everything that depends on edit rights.
+async function refreshRights() {
+  await loadAdmin();
+  loadSchedules();
+  renderListPanel();
+  renderBrowseItems();
+}
+
+function handleAuthError(error) {
+  if (error.status === 401) {
+    toast("Only the admin can do that. Use “Admin login” at the top.", "warn");
+    refreshRights();
+    return true;
+  }
+  return false;
+}
+
+$("#adminBtn").addEventListener("click", async (event) => {
+  if (state.isAdmin) {
+    await withLoading(event.currentTarget, "Logging out…", async () => {
+      await api("/api/admin/logout", {});
+      toast("Logged out. Schedules are view-only now.", "info");
+    });
+    refreshRights();
+    return;
+  }
+
+  $("#adminPassword").value = "";
+  $("#adminError").textContent = "";
+  $("#adminDialog").showModal();
+  $("#adminPassword").focus();
+});
+
+$("#adminCancel").addEventListener("click", () => $("#adminDialog").close());
+
+$("#adminForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+
+  await withLoading($("#adminSubmit"), "Checking…", async () => {
+    try {
+      await api("/api/admin/login", { password: $("#adminPassword").value });
+      $("#adminDialog").close();
+      toast("Logged in as admin.", "good");
+      setMood("happy", "hello, admin.");
+      refreshRights();
+    } catch (error) {
+      $("#adminError").textContent = error.message;
+      $("#adminPassword").select();
+    }
+  });
+});
+
+
+// ==========================================================
+// SAVED FOLDER LISTS
+// ==========================================================
+
+async function loadLists() {
+  try {
+    const data = await api("/api/folder-lists");
+    state.lists = data.lists || {};
+  } catch {
+    state.lists = {};
+  }
+
+  renderListScope();
+  renderListPanel();
+  renderBrowseItems();
+}
+
+// Summary under the Download card when "Folder list" is chosen.
+function renderListScope() {
+  const segments = state.segments.filter(s => state.selected.has(s));
+
+  $("#listScope").innerHTML = segments.map(segment => {
+    const folders = state.lists[segment] || [];
+    return `
+      <div class="seg-line">
+        <b>${escapeHtml(segment)}</b>
+        ${folders.length
+          ? `<span class="paths">${escapeHtml(folders.join(", "))}</span>`
+          : `<span class="empty-seg">empty list, will be skipped</span>`}
+      </div>`;
+  }).join("") + `<button type="button" class="link" id="manageLists">Manage lists in Browse NSE →</button>`;
+}
+
+$("#listScope").addEventListener("click", (event) => {
+  if (event.target.id === "manageLists") showTab("browse");
+});
+
+// Sidebar in Browse NSE for the segment being browsed.
+function renderListPanel() {
+  const segment = $("#browseSegment").value;
+  if (!segment) return;
+
+  const folders = state.lists[segment] || [];
+
+  $("#listTitle").textContent = `Folder list · ${segment}`;
+  $("#addCurrentFolder").classList.toggle("hidden", !state.canEdit);
+  $("#addCurrentFolder").disabled = state.browsePath === "/" || folders.includes(state.browsePath);
+
+  $("#listHelp").textContent = state.canEdit
+    ? "Used by the “Folder list” scope in downloads and schedules. Subfolders are included."
+    : "Used by the “Folder list” scope. Only the admin can change it.";
+
+  $("#listItems").innerHTML = folders.length
+    ? folders.map(folder => `
+        <li>
+          <span class="path">${escapeHtml(folder)}</span>
+          <button type="button" class="secondary" data-open-list="${escapeHtml(folder)}" title="Open in browser">Open</button>
+          ${state.canEdit
+            ? `<button type="button" class="danger" data-remove-list="${escapeHtml(folder)}" title="Remove from list">✕</button>`
+            : ""}
+        </li>`).join("")
+    : `<li class="empty-li">No folders yet.${state.canEdit ? " Open a folder and press “+ This folder”, or use “+ List” on a row." : ""}</li>`;
+}
+
+async function changeList(method, segment, folder, button) {
+  const run = async () => {
+    try {
+      const data = method === "add"
+        ? await api("/api/folder-lists", { segment, folder_path: folder })
+        : await api(`/api/folder-lists?segment=${encodeURIComponent(segment)}&folder_path=${encodeURIComponent(folder)}`, undefined, "DELETE");
+
+      state.lists[segment] = data.folders;
+      toast(method === "add" ? `Added ${folder} to the ${segment} list.` : `Removed ${folder} from the ${segment} list.`,
+        method === "add" ? "good" : "info");
+    } catch (error) {
+      if (!handleAuthError(error)) toast(error.message, "bad");
+    }
+  };
+
+  if (button) await withLoading(button, "…", run);
+  else await run();
+
+  renderListScope();
+  renderListPanel();
+  renderBrowseItems();
+}
+
+$("#addCurrentFolder").addEventListener("click", (event) =>
+  changeList("add", $("#browseSegment").value, state.browsePath, event.currentTarget));
+
+$("#listItems").addEventListener("click", (event) => {
+  const remove = event.target.closest("[data-remove-list]");
+  const open = event.target.closest("[data-open-list]");
+
+  if (remove) changeList("remove", $("#browseSegment").value, remove.dataset.removeList, remove);
+  if (open) openFolder(open.dataset.openList);
+});
 
 
 // ==========================================================
@@ -350,6 +545,7 @@ $("#segmentChips").addEventListener("click", (event) => {
 
   store.set("segments", [...state.selected]);
   renderSegmentChips();
+  renderListScope();
 });
 
 
@@ -373,7 +569,9 @@ function currentScope() {
 
 function showScope() {
   $("#folderScope").classList.toggle("hidden", currentScope() !== "folder");
+  $("#listScope").classList.toggle("hidden", currentScope() !== "list");
   store.set("scope", currentScope());
+  renderListScope();
 }
 
 $$("input[name='scope']").forEach(radio => {
@@ -446,8 +644,15 @@ async function startDownload() {
   }
 
   const date = toNseDate(isoDate);
-  const folderPath = currentScope() === "folder" ? normalisePath($("#scopeFolder").value) : "/";
+  const scope = currentScope();
+  const folderPath = scope === "folder" ? normalisePath($("#scopeFolder").value) : "/";
   const button = $("#startDownload");
+
+  if (scope === "list" && !segments.some(s => (state.lists[s] || []).length)) {
+    setMood("worried", "those folder lists are empty.");
+    toast("The folder list is empty for the selected segment(s). Add folders in Browse NSE.", "warn");
+    return;
+  }
   const started = Date.now();
 
   state.localBusy = true;
@@ -464,14 +669,25 @@ async function startDownload() {
 
   await withLoading(button, `Downloading ${segments.length > 1 ? `${segments.length} segments` : segments[0]}…`, async () => {
     for (const segment of segments) {
-      const where = folderPath === "/" ? segment : `${segment}${folderPath}`;
+      const listFolders = state.lists[segment] || [];
+      const where = scope === "list"
+        ? `${segment} (${listFolders.length} folder${listFolders.length === 1 ? "" : "s"})`
+        : folderPath === "/" ? segment : `${segment}${folderPath}`;
       const segmentStart = Date.now();
+
+      if (scope === "list" && !listFolders.length) {
+        setRow(segment, progressRow(segment, "skipped",
+          `<span class="muted small">folder list is empty</span>`));
+        continue;
+      }
 
       setMood("work", `fetching ${where} for ${date}…`);
       setRow(segment, progressRow(segment, "running", `<span class="muted small">listing folders and downloading…</span>`));
 
       try {
-        const result = await api("/api/nse/download-folder", { segment, folder_path: folderPath, date });
+        const result = scope === "list"
+          ? await api("/api/nse/download-list", { segment, date })
+          : await api("/api/nse/download-folder", { segment, folder_path: folderPath, date });
 
         totals.downloaded += result.downloaded || 0;
         totals.already += result.already_downloaded || 0;
@@ -537,6 +753,30 @@ async function openFolder(path) {
     return;
   }
 
+  // One listing at a time (one NSE login): remember the newest request
+  // and open it when the current listing finishes.
+  if (state.browseLoading) {
+    state.browsePending = path;
+    return;
+  }
+
+  state.browseLoading = true;
+
+  try {
+    await listFolder(path);
+  } finally {
+    state.browseLoading = false;
+  }
+
+  if (state.browsePending !== null && state.browsePending !== undefined) {
+    const next = state.browsePending;
+    state.browsePending = null;
+    openFolder(next);
+  }
+}
+
+async function listFolder(path) {
+
   const segment = $("#browseSegment").value;
   path = normalisePath(path);
 
@@ -545,50 +785,124 @@ async function openFolder(path) {
   $("#browsePath").value = path;
   renderCrumbs(path);
 
+  state.browseItems = null;
+  renderListPanel();
+
   $("#browseItems").innerHTML =
-    `<tr><td colspan="2" class="empty-cell"><span class="spinner"></span>Asking NSE for ${escapeHtml(segment)}${escapeHtml(path === "/" ? "" : path)}…</td></tr>`;
+    `<tr><td colspan="3" class="empty-cell"><span class="spinner"></span>Asking NSE for ${escapeHtml(segment)}${escapeHtml(path === "/" ? "" : path)}…</td></tr>`;
   setMood("sniff", `sniffing around ${segment}${path === "/" ? "" : path}…`);
 
   await withLoading($("#browseGo"), "Opening…", async () => {
     try {
       const data = await api("/api/nse/list", { segment, folder_path: path });
-      const items = Array.isArray(data.items) ? data.items : [];
-      const isFolder = (item) => String(item.type).toLowerCase() === "folder";
+      state.browseItems = Array.isArray(data.items) ? data.items : [];
+      renderBrowseItems();
 
-      const folders = items.filter(isFolder).sort((a, b) => a.name.localeCompare(b.name));
-      const files = items.filter(i => !isFolder(i))
-        .sort((a, b) => String(b.lastUpdated).localeCompare(String(a.lastUpdated)));
-
-      $("#browseItems").innerHTML = (folders.length || files.length) ? [
-        ...folders.map(f => `
-          <tr>
-            <td><button type="button" class="folder-link" data-folder="${escapeHtml(f.name)}">${escapeHtml(f.name)}</button></td>
-            <td class="muted" title="UTC: ${escapeHtml(f.lastUpdated)}">${escapeHtml(localTime(f.lastUpdated))}</td>
-          </tr>`),
-        ...files.map(f => `
-          <tr>
-            <td class="file-name">${escapeHtml(f.name)}</td>
-            <td class="muted" title="UTC: ${escapeHtml(f.lastUpdated)}">${escapeHtml(localTime(f.lastUpdated))}</td>
-          </tr>`),
-      ].join("") : `<tr><td colspan="2" class="empty-cell">This folder is empty.</td></tr>`;
+      const folders = state.browseItems.filter(isFolder).length;
+      const files = state.browseItems.length - folders;
 
       $("#browseInfo").textContent =
-        `${segment}${path === "/" ? "" : path} · ${folders.length} folder(s) · ${files.length} file(s). Times are local; hover for UTC.`;
-      setMood("sleep", `${folders.length} folder(s), ${files.length} file(s) here. back to napping.`);
+        `${segment}${path === "/" ? "" : path} · ${folders} folder(s) · ${files} file(s). Times are local; hover for UTC.`;
+      setMood("sleep", `${folders} folder(s), ${files} file(s) here. back to napping.`);
 
     } catch (error) {
-      $("#browseItems").innerHTML = `<tr><td colspan="2" class="empty-cell note">${escapeHtml(error.message)}</td></tr>`;
+      $("#browseItems").innerHTML = `<tr><td colspan="3" class="empty-cell note">${escapeHtml(error.message)}</td></tr>`;
       setMood("worried", "NSE didn't answer that one.");
       toast(error.message, error.status === 409 ? "warn" : "bad", 7000);
     }
   });
 }
 
+const isFolder = (item) => String(item.type).toLowerCase() === "folder";
+
+function renderBrowseItems() {
+  const items = state.browseItems;
+  if (!Array.isArray(items)) return;
+
+  const segment = $("#browseSegment").value;
+  const list = state.lists[segment] || [];
+
+  const folders = items.filter(isFolder).sort((a, b) => a.name.localeCompare(b.name));
+  const files = items.filter(i => !isFolder(i))
+    .sort((a, b) => String(b.lastUpdated).localeCompare(String(a.lastUpdated)));
+
+  $("#browseItems").innerHTML = (folders.length || files.length) ? [
+    ...folders.map(f => {
+      const path = joinPath(state.browsePath, f.name);
+      const parent = list.find(folder => path.startsWith(`${folder}/`));
+      const action = list.includes(path)
+        ? `<span class="in-list">✓ in list</span>`
+        : parent
+          ? `<span class="in-list muted" title="Already included through ${escapeHtml(parent)}">✓ via ${escapeHtml(parent)}</span>`
+        : state.canEdit
+          ? `<button type="button" class="secondary row-btn" data-add-folder="${escapeHtml(path)}" title="Add to the ${escapeHtml(segment)} folder list">+ List</button>`
+          : "";
+      return `
+        <tr>
+          <td><button type="button" class="folder-link" data-folder="${escapeHtml(f.name)}">${escapeHtml(f.name)}</button></td>
+          <td class="muted" title="UTC: ${escapeHtml(f.lastUpdated)}">${escapeHtml(localTime(f.lastUpdated))}</td>
+          <td class="num">${action}</td>
+        </tr>`;
+    }),
+    ...files.map(f => `
+      <tr>
+        <td class="file-name">${escapeHtml(f.name)}</td>
+        <td class="muted" title="UTC: ${escapeHtml(f.lastUpdated)}">${escapeHtml(localTime(f.lastUpdated))}</td>
+        <td class="num" data-file-cell="${escapeHtml(f.name)}">
+          <button type="button" class="secondary row-btn" data-download-file="${escapeHtml(f.name)}" title="Download just this file">Download</button>
+        </td>
+      </tr>`),
+  ].join("") : `<tr><td colspan="3" class="empty-cell">This folder is empty.</td></tr>`;
+
+  applyBusy();
+}
+
+async function downloadOneFile(button, fileName) {
+  const segment = $("#browseSegment").value;
+  const folder = state.browsePath;
+
+  state.localBusy = true;
+  applyBusy();
+  setMood("work", `fetching ${fileName}…`);
+
+  await withLoading(button, "Downloading…", async () => {
+    try {
+      const result = await api("/api/nse/download-file", { segment, folder_path: folder, file_name: fileName });
+
+      // Find the record so the file can be saved to this PC.
+      let saveLink = "";
+      try {
+        const record = await api(`/api/downloads?run_id=${result.run_id}&limit=1`);
+        const id = record.downloads && record.downloads[0] && record.downloads[0].id;
+        if (id) saveLink = ` <a class="save-link" href="/api/downloads/${id}/file" download>Save copy</a>`;
+      } catch { /* the download itself worked */ }
+
+      const cell = document.querySelector(`[data-file-cell="${CSS.escape(fileName)}"]`);
+      const label = result.status === "downloaded" ? "✓ saved" : "✓ already had";
+      if (cell) cell.innerHTML = `<span class="saved-ok">${label}</span>${saveLink}`;
+
+      toast(`${fileName}: ${result.status === "downloaded" ? "downloaded" : "already downloaded"} (dated ${result.exchange_date}).`, "good");
+      setMood("happy", `got ${fileName}.`);
+      loadRuns();
+
+    } catch (error) {
+      toast(`${fileName}: ${error.message}`, error.status === 409 ? "warn" : "bad", 7000);
+      setMood("worried", "that file didn't come through.");
+    }
+  });
+
+  state.localBusy = false;
+  applyBusy();
+}
+
 $("#browseGo").addEventListener("click", () => openFolder($("#browsePath").value));
 $("#browsePath").addEventListener("keydown", (event) => {
   if (event.key === "Enter") openFolder($("#browsePath").value);
 });
-$("#browseSegment").addEventListener("change", () => openFolder("/"));
+$("#browseSegment").addEventListener("change", () => {
+  renderListPanel();
+  openFolder("/");
+});
 
 $("#crumbs").addEventListener("click", (event) => {
   const crumb = event.target.closest("[data-path]");
@@ -597,7 +911,12 @@ $("#crumbs").addEventListener("click", (event) => {
 
 $("#browseItems").addEventListener("click", (event) => {
   const link = event.target.closest("[data-folder]");
+  const add = event.target.closest("[data-add-folder]");
+  const file = event.target.closest("[data-download-file]");
+
   if (link) openFolder(joinPath(state.browsePath, link.dataset.folder));
+  if (add) changeList("add", $("#browseSegment").value, add.dataset.addFolder, add);
+  if (file) downloadOneFile(file, file.dataset.downloadFile);
 });
 
 $("#useFolder").addEventListener("click", () => {
@@ -653,7 +972,9 @@ function renderRuns() {
         <td class="muted">${run.id}</td>
         <td>${escapeHtml(run.exchange_date || "—")}</td>
         <td><b>${escapeHtml(run.segment)}</b></td>
-        <td class="file-name">${escapeHtml(runScope(run))}${run.mode === "scheduled" ? '<span class="tag">scheduled</span>' : ""}</td>
+        <td class="file-name">${escapeHtml(runScope(run))}${
+          { scheduled: "scheduled", list: "folder list", file: "single file" }[run.mode]
+            ? `<span class="tag">${{ scheduled: "scheduled", list: "folder list", file: "single file" }[run.mode]}</span>` : ""}</td>
         <td><span class="badge ${escapeHtml(run.status)}">${escapeHtml(run.status)}</span></td>
         <td class="num">${number(run.files_found)}</td>
         <td class="num">${number(run.files_downloaded)}</td>
@@ -703,7 +1024,9 @@ async function loadRunFiles() {
         <td class="file-name muted">/${escapeHtml(String(f.folder_path || "").replace(/\/$/, ""))}</td>
         <td><span class="badge ${escapeHtml(f.status)}">${escapeHtml(f.status.replace("_", " "))}</span></td>
         <td class="num">${escapeHtml(fileSize(f.file_size))}</td>
-        <td class="note">${escapeHtml(f.error_message || "")}</td>
+        <td class="note">${f.status !== "failed"
+          ? `<a class="save-link" href="/api/downloads/${f.id}/file" download title="Save a copy to this PC">Save copy</a>`
+          : escapeHtml(f.error_message || "")}</td>
       </tr>`).join("")
       : `<tr><td colspan="5" class="empty-cell">${failedOnly
           ? "No failed files in this run."
@@ -812,7 +1135,10 @@ function describeRetries(s) {
 }
 
 function scheduleCard(s) {
-  const scope = s.scope === "folder" ? s.folders.join(", ") : "whole segment";
+  const scope = s.scope === "folder" ? s.folders.join(", ")
+    : s.scope === "list" ? "folder list"
+    : "whole segment";
+  const locked = state.canEdit ? "" : 'disabled title="Only the admin can change schedules"';
 
   const next = s.enabled
     ? (s.next_run_at
@@ -831,15 +1157,15 @@ function scheduleCard(s) {
     <div class="schedule ${s.enabled ? "" : "off"}" data-schedule="${s.id}">
       <div class="top">
         <span class="switch" title="${s.enabled ? "Pause" : "Enable"} this schedule">
-          <input type="checkbox" data-action="toggle" ${s.enabled ? "checked" : ""} aria-label="Enable ${escapeHtml(s.name)}">
+          <input type="checkbox" data-action="toggle" ${s.enabled ? "checked" : ""} ${locked} aria-label="Enable ${escapeHtml(s.name)}">
           <span></span>
         </span>
         <span class="clock">${escapeHtml(s.time)}</span>
         <span class="name" title="${escapeHtml(s.name)}">${escapeHtml(s.name)}</span>
         <div class="buttons">
           <button type="button" class="secondary" data-action="run" ${s.queued ? "disabled" : ""} title="Run this schedule now">Run</button>
-          <button type="button" class="secondary" data-action="edit">Edit</button>
-          <button type="button" class="danger" data-action="delete" title="Delete schedule">✕</button>
+          <button type="button" class="secondary" data-action="edit" ${locked}>Edit</button>
+          <button type="button" class="danger" data-action="delete" ${locked || 'title="Delete schedule"'}>✕</button>
         </div>
       </div>
       <div class="meta">
@@ -857,9 +1183,16 @@ async function loadSchedules() {
     state.schedules = data.schedules || [];
     state.defaults = data.defaults;
 
-    $("#schedulerInfo").textContent = data.scheduler_running
+    const rights = !state.adminConfigured
+      ? " · open to everyone"
+      : state.isAdmin ? " · admin" : " · view only";
+
+    $("#schedulerInfo").textContent = (data.scheduler_running
       ? `Scheduler running · ${data.timezone}`
-      : "Scheduler is off (NSE_SCHEDULER=off)";
+      : "Scheduler is off (NSE_SCHEDULER=off)") + rights;
+    $("#schedulerInfo").title = !state.adminConfigured
+      ? "Set ADMIN_PASSWORD in .env so only the admin can change schedules."
+      : "";
 
     $("#scheduleList").innerHTML = state.schedules.length
       ? state.schedules.map(scheduleCard).join("")
@@ -909,7 +1242,7 @@ $("#scheduleList").addEventListener("click", async (event) => {
         toast(`Deleted "${schedule.name}".`, "info");
         setMood("sleep", `deleted "${schedule.name}".`);
       } catch (error) {
-        toast(error.message, "bad");
+        if (!handleAuthError(error)) toast(error.message, "bad");
       }
     });
     loadSchedules();
@@ -943,7 +1276,7 @@ $("#scheduleList").addEventListener("change", async (event) => {
     setMood(toggle.checked ? "happy" : "sleep", toggle.checked ? `"${schedule.name}" is on.` : `"${schedule.name}" paused.`);
   } catch (error) {
     toggle.checked = !toggle.checked;
-    toast(error.message, "bad");
+    if (!handleAuthError(error)) toast(error.message, "bad");
   }
 
   loadSchedules();
@@ -983,6 +1316,16 @@ function updateHint() {
   const segs = state.segments.filter(s => editor.segments.has(s));
 
   $("#sFoldersWrap").classList.toggle("hidden", editorScope() !== "folder");
+  $("#sListInfo").classList.toggle("hidden", editorScope() !== "list");
+
+  if (editorScope() === "list") {
+    $("#sListInfo").textContent = segs.length
+      ? "Uses each segment's saved list at run time: " + segs.map(s => {
+          const n = (state.lists[s] || []).length;
+          return `${s} ${n ? `(${n} folder${n > 1 ? "s" : ""})` : "(empty, will fail)"}`;
+        }).join(", ") + ". Change the lists in Browse NSE."
+      : "";
+  }
 
   $("#sHint").textContent = (!days.length || !segs.length) ? "" :
     `${describeDays(days)} at ${time}: download ${segs.join(", ")} ` +
@@ -1087,6 +1430,7 @@ $("#scheduleForm").addEventListener("submit", async (event) => {
       loadSchedules();
     } catch (error) {
       $("#sError").textContent = error.message;
+      if (error.status === 401) refreshRights();
     }
   });
 });
@@ -1099,7 +1443,8 @@ $("#scheduleForm").addEventListener("submit", async (event) => {
 setMood("sleep", "zzz… pick a date and segments, I'll fetch the files.");
 renderCrumbs("/");
 checkHealth();
-loadSegments().then(() => {
+Promise.all([loadSegments(), loadAdmin()]).then(() => {
+  loadLists();
   loadSchedules();
   showTab(store.get("tab", "runs"));
 });

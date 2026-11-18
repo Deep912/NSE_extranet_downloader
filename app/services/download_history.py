@@ -158,6 +158,16 @@ class DownloadHistory:
             for row in rows
         }
 
+    def get_file_record(self, download_id: int) -> dict | None:
+        """One row of the downloads table, or None."""
+
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM downloads WHERE id = ?", (download_id,)
+            ).fetchone()
+
+        return dict(row) if row else None
+
     def is_already_downloaded(
         self,
         record: dict | None,

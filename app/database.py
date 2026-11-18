@@ -213,3 +213,27 @@ def init_db(database_path: Path | None = None):
                 updated_at TEXT NOT NULL
             )
         """)
+
+        # -------------------------------------------------
+        # 8. Saved folder lists (per segment)
+        # -------------------------------------------------
+        # Folders to download for the "Folder list" scope, e.g.
+        # CM: /Accounts, /NSP, /Onlinebackup, /Reports.
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS folder_lists (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                segment TEXT NOT NULL,
+                folder_path TEXT NOT NULL,
+                added_at TEXT NOT NULL,
+                UNIQUE(segment, folder_path)
+            )
+        """)
+
+        # Small key/value store for one-off flags (e.g. "lists seeded").
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS app_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)

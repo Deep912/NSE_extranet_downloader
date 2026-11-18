@@ -22,6 +22,9 @@ class Settings:
     nse_password: str = os.getenv("NSE_PASSWORD", "")
     nse_secret_key: str = os.getenv("NSE_SECRET_KEY", "")
     nse_timeout_seconds: float = float(os.getenv("NSE_TIMEOUT_SECONDS", "30"))
+    # Password for the single admin who may change schedules and folder
+    # lists. Empty = no admin login; schedules are open to everyone.
+    admin_password: str = os.getenv("ADMIN_PASSWORD", "")
 
     @property
     def nse_api_base_url(self) -> str:

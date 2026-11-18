@@ -141,8 +141,10 @@ class ScheduleStore:
 
         scope = payload.get("scope", DEFAULT_SCHEDULE["scope"])
 
-        if scope not in ("segment", "folder"):
-            raise ValueError("Scope must be 'segment' or 'folder'.")
+        # segment = whole segment, list = the segment's saved folder list,
+        # folder = folders typed into this schedule.
+        if scope not in ("segment", "list", "folder"):
+            raise ValueError("Scope must be 'segment', 'list' or 'folder'.")
 
         folders = payload.get("folders", [])
 
@@ -302,10 +304,12 @@ class Scheduler:
         now=datetime.now,
         tick_seconds: float = 15,
         due_window: timedelta = timedelta(minutes=5),
+        folder_lists=None,
     ):
         self.store = store
         self.downloader = downloader
         self.activity = activity
+        self.folder_lists = folder_lists
         self.history = history or DownloadHistory(store.database_path)
         self.now = now
         self.tick_seconds = tick_seconds
@@ -501,17 +505,20 @@ class Scheduler:
 
         today = self.now().date()
         dates = job.get("dates") or self.dates_for(schedule, job["base_date"], today)
-        folders = schedule["folders"] if schedule["scope"] == "folder" else ["/"]
 
-        steps = [
-            (day, segment, folder)
-            for day in dates
-            for segment in schedule["segments"]
-            for folder in folders
-        ]
+        def folders_for(segment: str) -> list[str]:
+            if schedule["scope"] == "folder":
+                return schedule["folders"]
+            if schedule["scope"] == "list":
+                return self.folder_lists.get(segment) if self.folder_lists else []
+            return ["/"]
+
+        # One run per date and segment; all its folders go in that run.
+        steps = [(day, segment) for day in dates for segment in schedule["segments"]]
 
         name = schedule["name"]
         totals = {"downloaded": 0, "already": 0, "failed": 0, "errors": 0}
+        errors: list[str] = []
         run_ids = []
 
         self.store.set_fields(schedule["id"], last_status="waiting")
@@ -523,20 +530,24 @@ class Scheduler:
                 last_run_started=_iso(self.now()),
             )
 
-            for number, (day, segment, folder) in enumerate(steps, start=1):
-                where = segment if folder == "/" else f"{segment}{folder}"
-
+            for number, (day, segment) in enumerate(steps, start=1):
                 self.activity.update(
-                    f"{name}: {where} {_nse_date(day)} ({number}/{len(steps)})"
+                    f"{name}: {segment} {_nse_date(day)} ({number}/{len(steps)})"
                 )
 
                 try:
-                    result = self.downloader.download_folder(
-                        segment, folder, _nse_date(day), mode="scheduled"
+                    folders = folders_for(segment)
+
+                    if not folders:
+                        raise ValueError(f"The folder list for {segment} is empty.")
+
+                    result = self.downloader.download_folders(
+                        segment, folders, _nse_date(day), mode="scheduled"
                     )
                 except Exception as exc:
                     totals["errors"] += 1
-                    print(f"[Scheduler] {where} {_nse_date(day)} failed: {exc}", flush=True)
+                    errors.append(f"{segment} {_nse_date(day)}: {exc}")
+                    print(f"[Scheduler] {segment} {_nse_date(day)} failed: {exc}", flush=True)
                     continue
 
                 run_ids.append(result.get("run_id"))
@@ -562,6 +573,10 @@ class Scheduler:
             f"{totals['failed'] + totals['errors']} failed · "
             f"{len(dates)} date(s) × {len(schedule['segments'])} segment(s)"
         )
+
+        if errors:
+            more = f" (+{len(errors) - 1} more)" if len(errors) > 1 else ""
+            summary += f" · {errors[0]}{more}"
 
         retries_left = (
             job["retries_left"] if job["kind"] == "retry" else schedule["retry_count"]
