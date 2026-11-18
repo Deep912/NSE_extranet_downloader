@@ -1,5 +1,7 @@
 
-from contextlib import asynccontextmanager
+import os
+from contextlib import asynccontextmanager, contextmanager
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -10,21 +12,59 @@ from app.config import settings, DOWNLOAD_ROOTS
 from app.database import init_db, get_connection
 from app.services.downloader import DownloaderService
 from app.services.folder_catalogue_service import FolderCatalogueService
+from app.services.nse_activity import NSEBusyError, activity
 from app.services.nse_client import NSEExtranetClient, NSEAPIError
+from app.services.scheduler import (
+    DEFAULT_SCHEDULE,
+    ScheduleStore,
+    Scheduler,
+    server_clock,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
 
 downloader = DownloaderService()
 catalogue_service = FolderCatalogueService()
+schedule_store = ScheduleStore()
+scheduler = Scheduler(schedule_store, downloader, activity)
 
 SUPPORTED_SEGMENTS = {"CM", "FO", "CD", "CO", "SLB"}
+
+DOWNLOAD_STATUSES = {"downloaded", "already_downloaded", "failed"}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+
+    # Set NSE_SCHEDULER=off to run without the background scheduler
+    # (for example in tests). Run uvicorn with a single worker, otherwise
+    # each worker process would run its own scheduler.
+    scheduler_enabled = os.getenv("NSE_SCHEDULER", "on").lower() != "off"
+
+    if scheduler_enabled:
+        scheduler.start()
+
     yield
+
+    if scheduler_enabled:
+        scheduler.stop()
+
+
+@contextmanager
+def nse_session(description: str):
+    """
+    Hold the single NSE session for a manual request.
+
+    Returns HTTP 409 if a scheduled run or another request is using NSE.
+    """
+
+    try:
+        with activity.try_hold(description):
+            yield
+    except NSEBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 app = FastAPI(
@@ -135,7 +175,12 @@ def list_segments():
 # --------------------------------------------------
 
 @app.get("/api/downloads")
-def list_downloads(limit: int = 100):
+def list_downloads(
+    limit: int = 100,
+    status: str | None = None,
+    run_id: int | None = None,
+):
+    """Recorded files, newest first. Optionally filter by status or run."""
 
     if limit < 1 or limit > 500:
         raise HTTPException(
@@ -143,23 +188,45 @@ def list_downloads(limit: int = 100):
             detail="limit must be between 1 and 500",
         )
 
+    if status is not None and status not in DOWNLOAD_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"status must be one of: {', '.join(sorted(DOWNLOAD_STATUSES))}",
+        )
+
+    conditions = []
+    params = []
+
+    if status is not None:
+        conditions.append("status = ?")
+        params.append(status)
+
+    if run_id is not None:
+        conditions.append("run_id = ?")
+        params.append(run_id)
+
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
     with get_connection() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT
                 id,
+                run_id,
                 segment,
                 exchange_date,
                 file_name,
                 folder_path,
                 status,
+                file_size,
                 downloaded_at,
                 error_message
             FROM downloads
+            {where}
             ORDER BY id DESC
             LIMIT ?
             """,
-            (limit,),
+            (*params, limit),
         ).fetchall()
 
     return {
@@ -183,12 +250,16 @@ def list_runs(limit: int = 50):
                 id,
                 segment,
                 mode,
+                exchange_date,
+                roots,
                 started_at,
                 finished_at,
                 status,
                 files_found,
                 files_downloaded,
                 files_skipped,
+                files_failed,
+                folders_failed,
                 error_message
             FROM download_runs
             ORDER BY id DESC
@@ -232,7 +303,7 @@ def nse_list(payload: dict):
     segment, folder_path = validate_folder_request(payload)
 
     try:
-        with NSEExtranetClient() as client:
+        with nse_session(f"Browsing {segment}{folder_path}"), NSEExtranetClient() as client:
             result = client.list_content(
                 segment=segment,
                 folder_path=folder_path,
@@ -273,7 +344,7 @@ def nse_scan(payload: dict):
     segment, root_path = validate_folder_request(payload)
 
     try:
-        with NSEExtranetClient() as client:
+        with nse_session(f"Scanning {segment}{root_path}"), NSEExtranetClient() as client:
             result = client.list_all_content(
                 segment=segment,
                 root_path=root_path,
@@ -313,7 +384,7 @@ def scan_nse_catalogue(segment: str = "CM"):
             flush=True,
         )
 
-        with NSEExtranetClient() as client:
+        with nse_session(f"Catalogue scan {segment}"), NSEExtranetClient() as client:
             scan_result = client.list_all_content(
                 segment=segment,
                 root_path="/",
@@ -359,6 +430,9 @@ def scan_nse_catalogue(segment: str = "CM"):
             status_code=400,
             detail=str(exc),
         ) from exc
+
+    except HTTPException:
+        raise  # e.g. 409 when NSE is busy
 
     except Exception as exc:
         print(
@@ -406,11 +480,12 @@ def nse_download_root(payload: dict):
         )
 
     try:
-        return downloader.download_root_folders(
-            segment=segment,
-            root_folders=root_folders,
-            date=date,
-        )
+        with nse_session(f"Manual download {segment} {date}"):
+            return downloader.download_root_folders(
+                segment=segment,
+                root_folders=root_folders,
+                date=date,
+            )
 
     except ValueError as exc:
         raise HTTPException(
@@ -446,11 +521,14 @@ def nse_download_folder(payload: dict):
     )
 
     try:
-        return downloader.download_folder(
-            segment=segment,
-            folder_path=folder_path,
-            date=date,
-        )
+        where = segment if folder_path == "/" else f"{segment}{folder_path}"
+
+        with nse_session(f"Manual download {where} {date}"):
+            return downloader.download_folder(
+                segment=segment,
+                folder_path=folder_path,
+                date=date,
+            )
 
     except ValueError as exc:
         raise HTTPException(
@@ -507,10 +585,11 @@ def nse_download_segments(payload: dict):
     )
 
     try:
-        return downloader.download_segments(
-            segments=validated_segments,
-            date=date,
-        )
+        with nse_session(f"Manual download {', '.join(validated_segments)} {date}"):
+            return downloader.download_segments(
+                segments=validated_segments,
+                date=date,
+            )
 
     except ValueError as exc:
         raise HTTPException(
@@ -529,3 +608,92 @@ def nse_download_segments(payload: dict):
             status_code=500,
             detail=f"Could not save downloaded files: {exc}",
         ) from exc
+
+
+# --------------------------------------------------
+# STATUS (what is using NSE right now)
+# --------------------------------------------------
+
+@app.get("/api/status")
+def app_status():
+    current = activity.status()
+
+    return {
+        "busy": current is not None,
+        "current": current,
+        "scheduler_running": scheduler.running,
+        **server_clock(),
+    }
+
+
+# --------------------------------------------------
+# SCHEDULES
+# --------------------------------------------------
+
+def _schedule_or_404(schedule_id: int) -> dict:
+    schedule = schedule_store.get(schedule_id)
+
+    if schedule is None:
+        raise HTTPException(status_code=404, detail="Schedule not found.")
+
+    return schedule
+
+
+@app.get("/api/schedules")
+def list_schedules():
+    return {
+        "schedules": [scheduler.describe(s) for s in schedule_store.list()],
+        "defaults": DEFAULT_SCHEDULE,
+        "scheduler_running": scheduler.running,
+        **server_clock(),
+    }
+
+
+@app.post("/api/schedules", status_code=201)
+def create_schedule(payload: dict):
+    try:
+        schedule = schedule_store.create(payload, datetime.now())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return scheduler.describe(schedule)
+
+
+@app.put("/api/schedules/{schedule_id}")
+def update_schedule(schedule_id: int, payload: dict):
+    _schedule_or_404(schedule_id)
+
+    try:
+        schedule = schedule_store.update(schedule_id, payload, datetime.now())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return scheduler.describe(schedule)
+
+
+@app.delete("/api/schedules/{schedule_id}")
+def delete_schedule(schedule_id: int):
+    _schedule_or_404(schedule_id)
+    schedule_store.delete(schedule_id)
+    return {"deleted": schedule_id}
+
+
+@app.post("/api/schedules/{schedule_id}/run", status_code=202)
+def run_schedule_now(schedule_id: int):
+    """Queue a schedule to run now. It waits for any running NSE session."""
+
+    _schedule_or_404(schedule_id)
+
+    if not scheduler.running:
+        raise HTTPException(
+            status_code=503,
+            detail="The scheduler is not running (NSE_SCHEDULER=off).",
+        )
+
+    if not scheduler.run_now(schedule_id):
+        raise HTTPException(
+            status_code=409,
+            detail="This schedule is already queued or running.",
+        )
+
+    return scheduler.describe(schedule_store.get(schedule_id))

@@ -8,68 +8,241 @@
 </head>
 <body>
   <main class="shell">
+
+    <!-- Header with mascot -->
     <header class="top">
-      <div>
-        <p class="eyebrow">LOCAL CONTROL PANEL · V0.2.0</p>
-        <h1>NSE Extranet Downloader</h1>
-        <p class="muted">LIVE API connection test and segment-wise file collection.</p>
+      <div class="title">
+        <p class="eyebrow">NSE EXTRANET · LOCAL</p>
+        <h1>Extranet Downloader</h1>
+        <p class="muted">Download a day's files for one or more segments, schedule nightly runs, browse NSE folders and check past runs.</p>
+        <span class="pill" id="apiStatus"><i></i> Checking app…</span>
       </div>
-      <span class="status"><i></i> Application running</span>
+
+      <figure class="mascot" aria-live="polite">
+        <pre id="cat" aria-hidden="true"></pre>
+        <figcaption id="catSays">…</figcaption>
+      </figure>
     </header>
 
-    <section class="notice">
-      <strong>LIVE integration · read-only listing stage</strong>
-      <p>This stage authenticates with NSE and reads folder contents only. It does not download or modify exchange files.</p>
-    </section>
+    <div class="banner hidden" id="busyBanner" role="status">
+      <span class="dot"></span>
+      <span id="busyText">NSE is busy.</span>
+    </div>
 
     <section class="grid">
-      <article class="panel">
-        <h2>Browse NSE folders</h2>
-        <p class="muted">Start with the CM segment root. You can enter a folder path after checking the root listing.</p>
-        <label for="segment">Segment</label>
-        <select id="segment"><option>CM</option></select>
-        <label for="folderPath">Folder path</label>
-        <input id="folderPath" type="text" value="/" autocomplete="off" spellcheck="false">
-        <button id="listFolders">Connect and list folder</button>
-        <p id="message" class="muted small">Credentials are read from your local .env file.</p>
+
+      <!-- Download -->
+      <article class="card">
+        <div class="card-head">
+          <h2>Download</h2>
+          <span class="muted small">Files whose NSE upload date matches</span>
+        </div>
+
+        <label for="date">Exchange date</label>
+        <div class="row">
+          <input id="date" type="date">
+          <button class="chip" type="button" data-day="0">Today</button>
+          <button class="chip" type="button" data-day="-1">Yesterday</button>
+        </div>
+
+        <label>Segments</label>
+        <div class="chips" id="segmentChips" role="group" aria-label="Segments"></div>
+
+        <label>Scope</label>
+        <div class="segmented" role="radiogroup" aria-label="Scope">
+          <label class="seg-option">
+            <input type="radio" name="scope" value="segment" checked>
+            <span>Whole segment</span>
+          </label>
+          <label class="seg-option">
+            <input type="radio" name="scope" value="folder">
+            <span>One folder</span>
+          </label>
+        </div>
+
+        <div id="folderScope" class="hidden">
+          <label for="scopeFolder">Folder path</label>
+          <input id="scopeFolder" type="text" value="/Reports" spellcheck="false" autocomplete="off">
+          <p class="muted small">Includes all subfolders. Tip: browse to a folder and press “Use for download”.</p>
+        </div>
+
+        <div class="actions">
+          <button id="startDownload" class="primary" type="button">Download</button>
+          <span class="muted small" id="downloadTimer"></span>
+        </div>
+
+        <ul class="progress" id="downloadProgress"></ul>
       </article>
 
-      <article class="panel">
-        <h2>Connection settings</h2>
-        <div class="metric"><span>Environment</span><b>LIVE</b></div>
-        <div class="metric"><span>API version</span><b>2.0</b></div>
-        <div class="metric"><span>Authentication</span><b>On demand</b></div>
-        <div class="metric"><span>Download engine</span><b>Not enabled</b></div>
-        <p class="muted small">NSE allows one active login per API user. This app logs out after each listing request.</p>
+      <!-- Browse -->
+      <article class="card">
+        <div class="card-head">
+          <h2>Browse NSE</h2>
+          <span class="muted small">Read-only listing</span>
+        </div>
+
+        <div class="row">
+          <select id="browseSegment" aria-label="Segment"></select>
+          <input id="browsePath" type="text" value="/" spellcheck="false" autocomplete="off" aria-label="Folder path">
+          <button id="browseGo" class="secondary" type="button">Open</button>
+        </div>
+
+        <nav class="crumbs" id="crumbs" aria-label="Folder path"></nav>
+
+        <div class="table-wrap browse-wrap">
+          <table>
+            <thead><tr><th>Name</th><th>Last updated</th></tr></thead>
+            <tbody id="browseItems">
+              <tr><td colspan="2" class="muted">Pick a segment and open a folder.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="actions">
+          <button id="useFolder" class="secondary" type="button">Use for download</button>
+          <span class="muted small" id="browseInfo"></span>
+        </div>
       </article>
     </section>
 
-    <section class="panel">
-      <div class="section-head">
-        <div><h2>Folder contents</h2><p class="muted" id="listingCaption">No folder has been queried yet.</p></div>
+    <!-- Schedules -->
+    <section class="card section">
+      <div class="card-head">
+        <div>
+          <h2>Schedules</h2>
+          <p class="muted small" id="clock">Times use this computer's clock.</p>
+        </div>
+        <button id="addSchedule" class="secondary" type="button">Add schedule</button>
       </div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Type</th><th>Name</th><th>Parent path</th><th>Last updated</th></tr></thead>
-          <tbody id="folderItems"><tr><td colspan="4" class="muted">No listing data.</td></tr></tbody>
-        </table>
+
+      <div id="scheduleList" class="schedule-list">
+        <p class="muted">Loading…</p>
       </div>
     </section>
 
-    <section class="panel">
-      <div class="section-head">
-        <div><h2>Recent download history</h2><p class="muted">Files recorded by the application.</p></div>
-        <button class="secondary" id="refresh">Refresh</button>
+    <!-- Runs -->
+    <section class="card">
+      <div class="card-head">
+        <div>
+          <h2>Runs</h2>
+          <p class="muted small">Every download is recorded. Click a run to see its files.</p>
+        </div>
+        <button id="refreshRuns" class="secondary" type="button">Refresh</button>
       </div>
+
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Segment</th><th>Exchange date</th><th>File</th><th>Status</th><th>Downloaded at</th></tr></thead>
-          <tbody id="downloads"><tr><td colspan="5" class="muted">No download records yet.</td></tr></tbody>
+          <thead>
+            <tr>
+              <th>#</th><th>Date</th><th>Segment</th><th>Scope</th><th>Status</th>
+              <th class="num">Matching</th><th class="num">New</th><th class="num">Had</th><th class="num">Failed</th>
+              <th>Started</th><th>Took</th>
+            </tr>
+          </thead>
+          <tbody id="runs">
+            <tr><td colspan="11" class="muted">Loading…</td></tr>
+          </tbody>
         </table>
       </div>
+
+      <div id="runFiles" class="hidden">
+        <div class="card-head sub">
+          <h3 id="runFilesTitle">Files</h3>
+          <label class="toggle"><input type="checkbox" id="failedOnly"> Failed only</label>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>File</th><th>Folder</th><th>Status</th><th class="num">Size</th><th>Note</th></tr></thead>
+            <tbody id="runFileRows"></tbody>
+          </table>
+        </div>
+      </div>
     </section>
-    <footer>Local development build · LIVE folder listing only</footer>
+
+    <footer>
+      One NSE login at a time: browsing and manual downloads wait while any download runs.
+    </footer>
   </main>
+
+  <!-- Schedule editor -->
+  <dialog id="scheduleDialog" aria-labelledby="scheduleDialogTitle">
+    <form id="scheduleForm" method="dialog" novalidate>
+      <div class="card-head">
+        <h2 id="scheduleDialogTitle">Add schedule</h2>
+        <label class="switch-label">
+          <span class="switch"><input type="checkbox" id="sEnabled" checked><span></span></span>
+          Enabled
+        </label>
+      </div>
+
+      <div class="form-grid">
+        <div>
+          <label for="sName">Name</label>
+          <input id="sName" type="text" maxlength="60" autocomplete="off">
+        </div>
+        <div>
+          <label for="sTime">Time</label>
+          <input id="sTime" type="time" required>
+        </div>
+      </div>
+
+      <label>Days</label>
+      <div class="chips" id="sDays" role="group" aria-label="Days"></div>
+      <div class="quick">
+        <button type="button" class="link" data-days="weekdays">Weekdays</button>
+        <button type="button" class="link" data-days="all">Every day</button>
+      </div>
+
+      <label>Segments</label>
+      <div class="chips" id="sSegments" role="group" aria-label="Segments"></div>
+
+      <label>Scope</label>
+      <div class="segmented" role="radiogroup" aria-label="Scope">
+        <label class="seg-option">
+          <input type="radio" name="sScope" value="segment" checked>
+          <span>Whole segment</span>
+        </label>
+        <label class="seg-option">
+          <input type="radio" name="sScope" value="folder">
+          <span>Specific folders</span>
+        </label>
+      </div>
+
+      <div id="sFoldersWrap" class="hidden">
+        <label for="sFolders">Folders (one per line, subfolders included)</label>
+        <textarea id="sFolders" rows="3" spellcheck="false" placeholder="/Reports&#10;/Onlinebackup"></textarea>
+      </div>
+
+      <div class="form-grid three">
+        <div>
+          <label for="sDaysBack">Dates covered</label>
+          <select id="sDaysBack"></select>
+        </div>
+        <div>
+          <label for="sRetries">Retries on failure</label>
+          <select id="sRetries"></select>
+        </div>
+        <div>
+          <label for="sRetryDelay">Retry after</label>
+          <select id="sRetryDelay"></select>
+        </div>
+      </div>
+
+      <label class="check">
+        <input type="checkbox" id="sCatchUp" checked>
+        <span>Catch up on missed runs: if the computer was off or asleep at the scheduled time, run as soon as the app is back.</span>
+      </label>
+
+      <p class="hint muted small" id="sHint"></p>
+      <p class="form-error" id="sError" role="alert"></p>
+
+      <div class="actions end">
+        <button type="button" class="secondary" id="sCancel">Cancel</button>
+        <button type="submit" class="primary" id="sSave">Save</button>
+      </div>
+    </form>
+  </dialog>
+
   <script src="/static/app.js"></script>
 </body>
 </html>

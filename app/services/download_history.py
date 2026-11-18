@@ -66,6 +66,31 @@ class DownloadHistory:
 
             return cursor.lastrowid
 
+    def mark_interrupted_runs(self) -> int:
+        """
+        Mark runs still shown as 'running' as 'interrupted'.
+
+        Called at startup: nothing can be running yet, so these runs were
+        cut off when the application stopped.
+        """
+
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE download_runs
+                SET status = 'interrupted',
+                    finished_at = COALESCE(finished_at, ?),
+                    error_message = COALESCE(
+                        error_message,
+                        'The application stopped during this run.'
+                    )
+                WHERE status = 'running'
+                """,
+                (self._now(),),
+            )
+
+            return cursor.rowcount
+
     def finish_run(
         self,
         run_id: int,

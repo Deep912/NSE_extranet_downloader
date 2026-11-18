@@ -727,8 +727,14 @@ class DownloaderService:
         segment: str,
         folder_path: str,
         date: str,
+        mode: str = "folder",
     ) -> dict:
-        """Recursively download matching files from one NSE folder."""
+        """
+        Recursively download matching files from one NSE folder.
+
+        mode is recorded with the run ("folder" for manual downloads,
+        "scheduled" for scheduler runs).
+        """
 
         segment = self._validate_segment(segment)
         date = self._validate_date(date)
@@ -740,7 +746,7 @@ class DownloaderService:
                 (folder_path.strip("/") or "/", folder_path)
             ],
             exchange_date=date,
-            mode="folder",
+            mode=mode,
         )
 
     def download_root_folders(

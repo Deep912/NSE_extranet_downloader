@@ -178,3 +178,38 @@ def init_db(database_path: Path | None = None):
             "files_failed": "INTEGER DEFAULT 0",
             "folders_failed": "INTEGER DEFAULT 0",
         })
+
+        # -------------------------------------------------
+        # 7. Download schedules
+        # -------------------------------------------------
+        # Times are this computer's local time. JSON columns hold lists.
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS schedules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                time_of_day TEXT NOT NULL,
+                days TEXT NOT NULL,
+                segments TEXT NOT NULL,
+                scope TEXT NOT NULL DEFAULT 'segment',
+                folders TEXT NOT NULL DEFAULT '[]',
+                days_back INTEGER NOT NULL DEFAULT 1,
+                retry_count INTEGER NOT NULL DEFAULT 2,
+                retry_delay_minutes INTEGER NOT NULL DEFAULT 15,
+                catch_up INTEGER NOT NULL DEFAULT 1,
+
+                last_slot TEXT,
+                last_run_started TEXT,
+                last_run_finished TEXT,
+                last_status TEXT,
+                last_summary TEXT,
+                last_run_ids TEXT,
+                retry_at TEXT,
+                retry_dates TEXT,
+                retries_left INTEGER NOT NULL DEFAULT 0,
+
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
