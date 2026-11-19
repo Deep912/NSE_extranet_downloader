@@ -1,5 +1,6 @@
 
 import json
+import logging
 import queue
 import re
 import threading
@@ -9,6 +10,7 @@ from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
 from app.database import get_connection
+from app.services.app_log import log
 from app.services.download_history import DownloadHistory
 from app.services.nse_activity import NSEActivity
 
@@ -400,7 +402,7 @@ class Scheduler:
         interrupted = self.history.mark_interrupted_runs()
 
         if interrupted:
-            print(f"[Scheduler] Marked {interrupted} unfinished run(s) as interrupted.", flush=True)
+            log.warning("Marked %s unfinished run(s) as interrupted (the app stopped during them).", interrupted)
 
         self._stop.clear()
         self._threads = [
@@ -411,7 +413,7 @@ class Scheduler:
         for thread in self._threads:
             thread.start()
 
-        print("[Scheduler] Started.", flush=True)
+        log.info("Scheduler started.")
 
     def stop(self) -> None:
         self._stop.set()
@@ -496,7 +498,7 @@ class Scheduler:
             try:
                 self.tick()
             except Exception as exc:  # keep the scheduler alive
-                print(f"[Scheduler] Tick failed: {type(exc).__name__}: {exc}", flush=True)
+                log.error("Scheduler check failed: %s: %s", type(exc).__name__, exc)
 
             self._stop.wait(self.tick_seconds)
 
@@ -510,7 +512,7 @@ class Scheduler:
             try:
                 self.run_job(job)
             except Exception as exc:
-                print(f"[Scheduler] Run failed: {type(exc).__name__}: {exc}", flush=True)
+                log.error("Schedule run failed: %s: %s", type(exc).__name__, exc)
                 self.store.set_fields(
                     job["schedule_id"],
                     last_status="failed",
@@ -555,6 +557,15 @@ class Scheduler:
 
         self.store.set_fields(schedule["id"], last_status="waiting")
 
+        log.info(
+            "Schedule '%s' (%s): %s step(s) - %s",
+            name, job["kind"], len(steps),
+            ", ".join(f"{segment} {_nse_date(day)}" for day, segment in steps),
+        )
+
+        if self.activity.status() is not None:
+            log.info("Schedule '%s' is waiting for: %s", name, self.activity.status().get("description"))
+
         with self.activity.hold(f"{name}: starting", kind="scheduled"):
             self.store.set_fields(
                 schedule["id"],
@@ -584,7 +595,7 @@ class Scheduler:
                     totals["errors"] += 1
                     failed_steps.append((day, segment))
                     errors.append(f"{segment} {_nse_date(day)}: {exc}")
-                    print(f"[Scheduler] {segment} {_nse_date(day)} failed: {exc}", flush=True)
+                    log.error("Schedule '%s': %s %s failed: %s", name, segment, _nse_date(day), exc)
                     continue
 
                 run_ids.append(result.get("run_id"))
@@ -659,6 +670,11 @@ class Scheduler:
             })
 
         self.store.set_fields(schedule["id"], **fields)
+
+        log.log(
+            logging.INFO if status == "completed" else logging.WARNING,
+            "Schedule '%s' %s: %s", name, status, fields["last_summary"],
+        )
 
         return {"status": status, "summary": fields["last_summary"], **totals}
 

@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from app.config import settings, DOWNLOAD_ROOTS
 from app.database import init_db, get_connection
 from app.services.admin_auth import AdminAuth
+from app.services.app_log import log, log_file, recent, setup_logging
 from app.services.downloader import DownloaderService
 from app.services.folder_catalogue_service import FolderCatalogueService
 from app.services.folder_lists import FolderListStore
@@ -41,6 +42,9 @@ DOWNLOAD_STATUSES = {"downloaded", "already_downloaded", "failed"}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    setup_logging(settings.log_level, settings.log_dir)
+    log.info("App started (NSE %s). Log file: %s", settings.nse_environment, log_file() or "none")
+
     init_db()
 
     # First start only: fill the folder lists from DOWNLOAD_ROOTS in config.py.
@@ -53,11 +57,15 @@ async def lifespan(app: FastAPI):
 
     if scheduler_enabled:
         scheduler.start()
+    else:
+        log.info("Scheduler is off (NSE_SCHEDULER=off).")
 
     yield
 
     if scheduler_enabled:
         scheduler.stop()
+
+    log.info("App stopped.")
 
 
 @contextmanager
@@ -407,10 +415,7 @@ def scan_nse_catalogue(segment: str = "CM"):
     segment = validate_segment(segment)
 
     try:
-        print(
-            f"[NSE] Starting catalogue scan: {segment}",
-            flush=True,
-        )
+        log.info("Catalogue scan started: %s", segment)
 
         with nse_session(f"Catalogue scan {segment}"), NSEExtranetClient() as client:
             scan_result = client.list_all_content(
@@ -424,11 +429,9 @@ def scan_nse_catalogue(segment: str = "CM"):
             service="member",
         )
 
-        print(
-            f"[NSE] Catalogue saved: "
-            f"{saved_result['folders_saved']} folders, "
-            f"{saved_result['files_saved']} files",
-            flush=True,
+        log.info(
+            "Catalogue saved: %s folders, %s files",
+            saved_result["folders_saved"], saved_result["files_saved"],
         )
 
         return {
@@ -443,10 +446,7 @@ def scan_nse_catalogue(segment: str = "CM"):
         }
 
     except NSEAPIError as exc:
-        print(
-            f"[NSE] API error: {exc}",
-            flush=True,
-        )
+        log.error("Catalogue scan NSE error: %s", exc)
 
         raise HTTPException(
             status_code=502,
@@ -463,10 +463,7 @@ def scan_nse_catalogue(segment: str = "CM"):
         raise  # e.g. 409 when NSE is busy
 
     except Exception as exc:
-        print(
-            f"[NSE] Catalogue scan failed: {exc}",
-            flush=True,
-        )
+        log.error("Catalogue scan failed: %s", exc)
 
         raise HTTPException(
             status_code=500,
@@ -686,6 +683,7 @@ def create_schedule(payload: dict, request: Request):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    log.info("Admin added schedule '%s'.", schedule["name"])
     return scheduler.describe(schedule)
 
 
@@ -699,14 +697,19 @@ def update_schedule(schedule_id: int, payload: dict, request: Request):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    log.info(
+        "Admin changed schedule '%s' (%s).",
+        schedule["name"], "on" if schedule["enabled"] else "off",
+    )
     return scheduler.describe(schedule)
 
 
 @app.delete("/api/schedules/{schedule_id}")
 def delete_schedule(schedule_id: int, request: Request):
     require_admin(request)
-    _schedule_or_404(schedule_id)
+    schedule = _schedule_or_404(schedule_id)
     schedule_store.delete(schedule_id)
+    log.info("Admin deleted schedule '%s'.", schedule["name"])
     return {"deleted": schedule_id}
 
 
@@ -727,6 +730,8 @@ def run_schedule_now(schedule_id: int):
             status_code=409,
             detail="This schedule is already queued or running.",
         )
+
+    log.info("Schedule #%s queued by the Run button.", schedule_id)
 
     return scheduler.describe(schedule_store.get(schedule_id))
 
@@ -758,8 +763,11 @@ def admin_login(payload: dict):
     token = admin.login(str(payload.get("password", "")))
 
     if token is None:
+        log.warning("Admin sign-in failed: wrong password.")
         time.sleep(1)  # slow down password guessing
         raise HTTPException(status_code=401, detail="Wrong password.")
+
+    log.info("Admin signed in.")
 
     response = JSONResponse({"is_admin": True, "can_edit": True})
     response.set_cookie(
@@ -802,6 +810,11 @@ def add_to_folder_list(payload: dict, request: Request):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    log.info(
+        "Admin added %s %s to the folder list.",
+        str(payload.get("segment")).upper(), payload.get("folder_path"),
+    )
+
     return {"segment": str(payload.get("segment")).upper(), "folders": folders}
 
 
@@ -813,6 +826,8 @@ def remove_from_folder_list(segment: str, folder_path: str, request: Request):
         folders = folder_lists.remove(segment, folder_path)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    log.info("Admin removed %s %s from the folder list.", segment.upper(), folder_path)
 
     return {"segment": segment.upper(), "folders": folders}
 
@@ -918,6 +933,7 @@ def stop_current(request: Request):
     if status is None:  # finished in the meantime
         raise HTTPException(status_code=409, detail="Nothing is running.")
 
+    log.warning("Stop requested: %s", status.get("description"))
     return {"stopping": True, "current": status}
 
 
@@ -933,10 +949,16 @@ def _not_while_busy() -> None:
         )
 
 
-def _finish_delete(removed: dict, delete_files: bool) -> dict:
+def _finish_delete(removed: dict, delete_files: bool, what: str) -> dict:
     files = (
         downloader.remove_local_files(removed["local_paths"])
         if delete_files else None
+    )
+
+    kept = f", {files['deleted']} local file(s)" if files else ", local files kept"
+    log.info(
+        "Admin deleted %s: %s run(s), %s file record(s)%s.",
+        what, removed["runs"], removed["file_records"], kept,
     )
 
     return {
@@ -959,7 +981,7 @@ def delete_run(run_id: int, request: Request, delete_files: bool = False):
     if removed is None:
         raise HTTPException(status_code=404, detail="Run not found.")
 
-    return _finish_delete(removed, delete_files)
+    return _finish_delete(removed, delete_files, f"run #{run_id}")
 
 
 @app.delete("/api/downloads/{download_id}")
@@ -972,7 +994,7 @@ def delete_download_record(download_id: int, request: Request, delete_files: boo
     if removed is None:
         raise HTTPException(status_code=404, detail="File record not found.")
 
-    return _finish_delete(removed, delete_files)
+    return _finish_delete(removed, delete_files, f"file record #{download_id}")
 
 
 @app.post("/api/history/cleanup")
@@ -1016,4 +1038,28 @@ def cleanup_history(payload: dict, request: Request):
             "bytes": removed["bytes"],
         }
 
-    return {"dry_run": False, **_finish_delete(removed, delete_files)}
+    what = (
+        f"history for {segment or 'all segments'} "
+        f"{date_from:%d-%m-%Y} to {date_to:%d-%m-%Y}"
+    )
+    return {"dry_run": False, **_finish_delete(removed, delete_files, what)}
+
+
+# --------------------------------------------------
+# LOG
+# --------------------------------------------------
+
+@app.get("/api/logs")
+def get_logs(after: int = 0, limit: int = 500, problems_only: bool = False):
+    """
+    Recent log lines (newest last), for the dashboard's Log tab. Pass the
+    returned `last` as `after` to get only new lines next time.
+    """
+
+    limit = max(1, min(limit, 2000))
+    path = log_file()
+
+    return {
+        **recent.since(after, limit, problems_only),
+        "file": str(path) if path else None,
+    }

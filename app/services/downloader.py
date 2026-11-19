@@ -1,10 +1,13 @@
 
 import hashlib
+import logging
 import re
+import time
 
 from datetime import datetime, date
 from pathlib import Path
 
+from app.services.app_log import format_seconds, format_size, log
 from app.services.nse_client import NSEExtranetClient, NSEAPIError
 from app.services.folder_catalogue_service import FolderCatalogueService
 from app.services.download_history import DownloadHistory
@@ -363,6 +366,13 @@ class DownloaderService:
             roots=result["selected_roots"],
         )
         result["run_id"] = run_id
+        run_started = time.monotonic()
+
+        log.info(
+            "Run #%s started: %s %s (%s) - %s",
+            run_id, segment, exchange_date, mode,
+            ", ".join(result["selected_roots"]) or "/",
+        )
 
         recorded = self.history.get_recorded_files(
             segment,
@@ -382,11 +392,9 @@ class DownloaderService:
                     pending = [(root_path, 0)]
                     visited = set()
 
-                    print(
-                        f"[NSE] Starting selected root: "
-                        f"{segment}/{root_path}",
-                        flush=True,
-                    )
+                    root_started = time.monotonic()
+                    root_matching_before = result["matching_files"]
+                    root_seen_before = result["total_files_seen"]
 
                     while pending:
                         # Safe point: stop before listing another folder.
@@ -430,9 +438,8 @@ class DownloaderService:
                         root_result["folders_scanned"] += 1
                         result["folders_scanned"] += 1
 
-                        print(
-                            f"[NSE] Listing {segment}/{current_path}",
-                            flush=True,
+                        log.debug(
+                            "Listing %s %s", segment, self._api_path(current_path),
                         )
 
                         try:
@@ -457,10 +464,9 @@ class DownloaderService:
                                 "error": str(exc),
                             })
 
-                            print(
-                                f"[NSE] Listing failed for "
-                                f"{current_path}: {exc}",
-                                flush=True,
+                            log.warning(
+                                "Run #%s: could not list %s %s: %s",
+                                run_id, segment, self._api_path(current_path), exc,
                             )
                             continue
 
@@ -508,6 +514,8 @@ class DownloaderService:
                         if files_in_folder:
                             result["folders_with_files"] += 1
 
+                        folder_matching_before = result["matching_files"]
+
                         # Download matching individual files.
                         for file_item in files_in_folder:
                             filename = file_item["name"]
@@ -529,10 +537,9 @@ class DownloaderService:
                                     ),
                                 })
 
-                                print(
-                                    f"[NSE] Skipping {filename}: "
-                                    "lastUpdated date unavailable",
-                                    flush=True,
+                                log.warning(
+                                    "Run #%s: skipped %s %s%s - NSE gave no upload date",
+                                    run_id, segment, current_path, filename,
                                 )
                                 continue
 
@@ -564,6 +571,11 @@ class DownloaderService:
                                 result["skipped"] += 1
                                 result["already_downloaded"] += 1
 
+                                log.debug(
+                                    "Already have %s %s%s (from history)",
+                                    segment, current_path, filename,
+                                )
+
                                 result["downloads"].append({
                                     "status": "already_downloaded",
                                     "source": "history",
@@ -577,11 +589,7 @@ class DownloaderService:
                             if self.should_stop():
                                 raise DownloadCancelled()
 
-                            print(
-                                f"[NSE] Downloading "
-                                f"{segment}/{current_path}{filename}",
-                                flush=True,
-                            )
+                            file_started = time.monotonic()
 
                             try:
                                 file_bytes = client.download_single_file(
@@ -615,6 +623,15 @@ class DownloaderService:
 
                                 result["downloads"].append(saved)
 
+                                log.info(
+                                    "%s %s %s%s - %s in %s",
+                                    "Downloaded" if saved["status"] == "downloaded"
+                                    else "Same as saved copy",
+                                    segment, current_path, filename,
+                                    format_size(saved["file_size"]),
+                                    format_seconds(time.monotonic() - file_started),
+                                )
+
                                 if saved["status"] == "downloaded":
                                     result["downloaded"] += 1
 
@@ -647,11 +664,22 @@ class DownloaderService:
                                     error_message=str(exc),
                                 )
 
-                                print(
-                                    f"[NSE] Download failed for "
-                                    f"{filename}: {exc}",
-                                    flush=True,
+                                log.warning(
+                                    "Run #%s: download failed for %s %s%s after %s: %s",
+                                    run_id, segment, current_path, filename,
+                                    format_seconds(time.monotonic() - file_started), exc,
                                 )
+
+                        folder_matching = (
+                            result["matching_files"] - folder_matching_before
+                        )
+
+                        if folder_matching:
+                            log.info(
+                                "%s %s: %s of %s file(s) are for %s",
+                                segment, self._api_path(current_path),
+                                folder_matching, len(files_in_folder), exchange_date,
+                            )
 
                         # Always recurse into child folders.
                         # Do not filter folders by their own lastUpdated date.
@@ -677,10 +705,15 @@ class DownloaderService:
                         [],
                     ).append(root_result)
 
-                    print(
-                        f"[NSE] Finished root {display_name}: "
-                        f"{root_result['folders_scanned']} folders scanned",
-                        flush=True,
+                    log.info(
+                        "Run #%s: finished %s %s - %s folder(s), %s of %s file(s) "
+                        "for %s, %s",
+                        run_id, segment, self._api_path(root_path),
+                        root_result["folders_scanned"],
+                        result["matching_files"] - root_matching_before,
+                        result["total_files_seen"] - root_seen_before,
+                        exchange_date,
+                        format_seconds(time.monotonic() - root_started),
                     )
 
         except DownloadCancelled:
@@ -699,14 +732,16 @@ class DownloaderService:
                 error_message="Stopped by user.",
             )
 
-            print(
-                f"[NSE] Download run {run_id} stopped by user after "
-                f"{result['downloaded']} new file(s).",
-                flush=True,
+            log.warning(
+                "Run #%s stopped by user after %s new file(s), %s.",
+                run_id, result["downloaded"],
+                format_seconds(time.monotonic() - run_started),
             )
             return result
 
         except Exception as exc:
+            log.error("Run #%s failed: %s: %s", run_id, type(exc).__name__, exc)
+
             # Do not leave the run marked as 'running'.
             self.history.finish_run(
                 run_id,
@@ -749,13 +784,14 @@ class DownloaderService:
             ),
         )
 
-        print(
-            f"[NSE] Download run {run_id} finished: "
-            f"{result['downloaded']} downloaded, "
-            f"{result['already_downloaded']} already downloaded, "
-            f"{result['other_date']} other dates, "
-            f"{result['failed']} failed.",
-            flush=True,
+        log.log(
+            logging.WARNING if result["failed"] else logging.INFO,
+            "Run #%s %s in %s: %s new, %s already had, %s failed - "
+            "%s of %s file(s) seen were for %s.",
+            run_id, result["status"],
+            format_seconds(time.monotonic() - run_started),
+            result["downloaded"], result["already_downloaded"], result["failed"],
+            result["matching_files"], result["total_files_seen"], exchange_date,
         )
 
         return result
@@ -958,6 +994,10 @@ class DownloaderService:
                 )
 
             except Exception as exc:
+                log.warning(
+                    "Single file %s %s/%s failed: %s",
+                    segment, api_path.rstrip("/"), filename, exc,
+                )
                 self.history.record_file(
                     run_id=run_id,
                     segment=segment,
@@ -987,9 +1027,10 @@ class DownloaderService:
             files_skipped=0 if downloaded else 1,
         )
 
-        print(
-            f"[NSE] Single file {segment}{api_path}/{filename}: {saved['status']}",
-            flush=True,
+        log.info(
+            "Single file %s %s/%s: %s - %s",
+            segment, api_path.rstrip("/"), filename, saved["status"],
+            format_size(saved["file_size"]),
         )
 
         return {

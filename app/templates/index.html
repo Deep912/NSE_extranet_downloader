@@ -112,6 +112,9 @@
             <button type="button" role="tab" id="tabBrowse" aria-controls="panelBrowse" aria-selected="false">
               Browse NSE
             </button>
+            <button type="button" role="tab" id="tabLog" aria-controls="panelLog" aria-selected="false">
+              Log <span class="count warn-count hidden" id="logProblems" title="Warnings and errors since the page was opened"></span>
+            </button>
           </div>
 
           <div class="tab-tools" id="runsTools">
@@ -121,6 +124,11 @@
             <label class="toggle"><input type="checkbox" id="problemsOnly"> Problems only</label>
             <button id="cleanupBtn" class="secondary admin-only" type="button" title="Delete history for a segment and date range">Clean up…</button>
             <button id="refreshRuns" class="secondary" type="button">Refresh</button>
+          </div>
+
+          <div class="tab-tools hidden" id="logTools">
+            <label class="toggle"><input type="checkbox" id="logProblemsOnly"> Warnings &amp; errors only</label>
+            <label class="toggle"><input type="checkbox" id="logFollow" checked> Follow new lines</label>
           </div>
         </div>
 
@@ -194,6 +202,14 @@
           </div>
 
           <p class="muted small" id="browseInfo">One NSE login at a time, so browsing waits while a download runs.</p>
+        </div>
+
+        <!-- Log -->
+        <div id="panelLog" role="tabpanel" aria-labelledby="tabLog" class="panel hidden">
+          <div class="log-view scroll" id="logView" role="log" aria-live="off" tabindex="0">
+            <div class="log-empty">Loading…</div>
+          </div>
+          <p class="muted small" id="logInfo">The last 2000 lines since the app started. Every line is also saved to the log file.</p>
         </div>
       </section>
     </main>

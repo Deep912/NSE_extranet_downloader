@@ -29,6 +29,13 @@ Open http://127.0.0.1:8000
 pytest -q
 ```
 
+## Logs
+
+- Dashboard: the **Log** tab shows the latest lines and highlights warnings and errors.
+- File: `logs/app.log`, a new file every midnight, kept for 30 days (`LOG_DIR` in `.env` to move it).
+- Console: the same lines with timestamps; routine dashboard GET requests are not shown.
+- `LOG_LEVEL=DEBUG` also logs every folder listed and every file skipped from history.
+
 ## API docs
 
 Open http://127.0.0.1:8000/docs

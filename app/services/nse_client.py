@@ -4,6 +4,7 @@ import time
 import httpx
 
 from app.config import settings
+from app.services.app_log import log
 from app.services.crypto import encrypt_nse_password
 
 
@@ -138,6 +139,7 @@ class NSEExtranetClient:
             )
 
         self._token = token
+        log.info("Signed in to NSE %s.", settings.nse_environment)
         return token
 
     def _ensure_authenticated(self) -> None:
@@ -284,11 +286,9 @@ class NSEExtranetClient:
 
             delay = self.RETRY_DELAYS_SECONDS[attempt - 1]
 
-            print(
-                f"[NSE] {reason} for {description} "
-                f"(attempt {attempt}/{attempts}). "
-                f"Retrying in {delay}s...",
-                flush=True,
+            log.warning(
+                "NSE %s for %s (attempt %s/%s). Retrying in %ss.",
+                reason, description, attempt, attempts, delay,
             )
 
             time.sleep(delay)
@@ -411,10 +411,12 @@ class NSEExtranetClient:
             headers=self._auth_headers(),
         )
 
-        print("HTTP status:", response.status_code)
-        print("Content-Type:", response.headers.get("content-type"))
-        print("Content-Length:", response.headers.get("content-length"))
-        print("Response preview:", response.content[:300])
+        log.debug(
+            "Test download: HTTP %s, %s, %s bytes",
+            response.status_code,
+            response.headers.get("content-type"),
+            response.headers.get("content-length"),
+        )
 
         return response
 
@@ -434,10 +436,7 @@ class NSEExtranetClient:
         failed_folders = []
         folders_scanned = 0
 
-        print(
-            f"[NSE] Starting recursive scan: {segment}",
-            flush=True,
-        )
+        log.info("Scanning all folders of %s.", segment)
 
         while pending:
             current_path, depth = pending.pop()
@@ -446,10 +445,7 @@ class NSEExtranetClient:
                 continue
 
             if folders_scanned >= max_folders:
-                print(
-                    f"[NSE] Maximum folder limit reached: {max_folders}",
-                    flush=True,
-                )
+                log.warning("Scan stopped at the folder limit (%s).", max_folders)
                 break
 
             if depth > 20:
@@ -462,11 +458,7 @@ class NSEExtranetClient:
             visited.add(current_path)
             folders_scanned += 1
 
-            print(
-                f"[NSE] Scanning {current_path} "
-                f"({folders_scanned}/{max_folders})",
-                flush=True,
-            )
+            log.debug("Scanning %s (%s/%s)", current_path, folders_scanned, max_folders)
 
             try:
                 result = self.list_content(
@@ -481,17 +473,10 @@ class NSEExtranetClient:
                         f"Unexpected folder listing data for {current_path}"
                     )
 
-                print(
-                    f"[NSE] Completed {current_path} "
-                    f"— {len(items)} items found",
-                    flush=True,
-                )
+                log.debug("Scanned %s: %s item(s)", current_path, len(items))
 
             except NSEAPIError as exc:
-                print(
-                    f"[NSE] ERROR in {current_path}: {exc}",
-                    flush=True,
-                )
+                log.warning("Scan could not list %s: %s", current_path, exc)
 
                 failed_folders.append({
                     "folder": current_path,
@@ -544,10 +529,9 @@ class NSEExtranetClient:
             and folders_scanned < max_folders
         )
 
-        print(
-            f"[NSE] Scan finished: {folders_scanned} folders, "
-            f"{len(files)} files, {len(failed_folders)} errors",
-            flush=True,
+        log.info(
+            "Scan finished: %s folder(s), %s file(s), %s error(s).",
+            folders_scanned, len(files), len(failed_folders),
         )
 
         return {
@@ -577,8 +561,10 @@ class NSEExtranetClient:
                     },
                 )
 
-            except httpx.HTTPError:
-                pass
+                log.info("Signed out of NSE.")
+
+            except httpx.HTTPError as exc:
+                log.warning("NSE sign-out failed: %s", type(exc).__name__)
 
             finally:
                 self._token = None

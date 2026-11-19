@@ -15,6 +15,8 @@ class Settings:
     database_path: Path = Path(os.getenv("DATABASE_PATH", str(PROJECT_ROOT / "data" / "nse_downloader.db")))
     download_dir: Path = Path(os.getenv("DOWNLOAD_DIR", str(PROJECT_ROOT / "storage")))
     log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
+    # Daily log files (app.log, app.log.2026-11-18, ...), kept for 30 days.
+    log_dir: Path = Path(os.getenv("LOG_DIR", str(PROJECT_ROOT / "logs")))
     nse_environment: str = os.getenv("NSE_ENVIRONMENT", "LIVE").upper()
     nse_api_version: str = os.getenv("NSE_API_VERSION", "2.0")
     nse_member_code: str = os.getenv("NSE_MEMBER_CODE", "").strip()

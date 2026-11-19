@@ -477,21 +477,126 @@ $("#listItems").addEventListener("click", (event) => {
 // ==========================================================
 
 function showTab(name) {
-  const runs = name === "runs";
+  if (!["runs", "browse", "log"].includes(name)) name = "runs";
 
-  $("#tabRuns").setAttribute("aria-selected", String(runs));
-  $("#tabBrowse").setAttribute("aria-selected", String(!runs));
-  $("#panelRuns").classList.toggle("hidden", !runs);
-  $("#panelBrowse").classList.toggle("hidden", runs);
-  $("#runsTools").classList.toggle("hidden", !runs);
+  for (const [tab, id] of [["runs", "Runs"], ["browse", "Browse"], ["log", "Log"]]) {
+    $(`#tab${id}`).setAttribute("aria-selected", String(name === tab));
+    $(`#panel${id}`).classList.toggle("hidden", name !== tab);
+  }
+  $("#runsTools").classList.toggle("hidden", name !== "runs");
+  $("#logTools").classList.toggle("hidden", name !== "log");
 
   store.set("tab", name);
 
-  if (!runs && !state.browseLoaded && !state.busy) openFolder("/");
+  if (name === "browse" && !state.browseLoaded && !state.busy) openFolder("/");
+  if (name === "log") {
+    logState.problems = 0;
+    renderLogBadge();
+    loadLog(true);
+  }
 }
 
 $("#tabRuns").addEventListener("click", () => showTab("runs"));
 $("#tabBrowse").addEventListener("click", () => showTab("browse"));
+$("#tabLog").addEventListener("click", () => showTab("log"));
+
+
+// ==========================================================
+// LOG
+// ==========================================================
+
+const logState = { last: 0, lines: [], loading: false, problems: 0, file: null };
+const LOG_KEEP = 2000;
+
+function logTabOpen() {
+  return !$("#panelLog").classList.contains("hidden");
+}
+
+function renderLogBadge() {
+  const badge = $("#logProblems");
+  badge.textContent = logState.problems ? String(logState.problems) : "";
+  badge.classList.toggle("hidden", !logState.problems || logTabOpen());
+}
+
+function logLineHtml(line, previous) {
+  const day = line.time.slice(0, 10);
+  const header = !previous || previous.time.slice(0, 10) !== day
+    ? `<div class="log-day">${escapeHtml(day)}</div>` : "";
+
+  return `${header}<div class="log-line ${escapeHtml(line.level)}">` +
+    `<span class="t">${escapeHtml(line.time.slice(11, 19))}</span>` +
+    `<span class="lv">${escapeHtml(line.level === "WARNING" ? "WARN" : line.level)}</span>` +
+    `<span class="m">${escapeHtml(line.message)}</span></div>`;
+}
+
+function renderLog() {
+  const view = $("#logView");
+  const onlyProblems = $("#logProblemsOnly").checked;
+  const lines = onlyProblems
+    ? logState.lines.filter(l => l.level !== "INFO" && l.level !== "DEBUG")
+    : logState.lines;
+
+  if (!lines.length) {
+    view.innerHTML = `<div class="log-empty">${onlyProblems ? "No warnings or errors." : "Nothing logged yet."}</div>`;
+    return;
+  }
+
+  view.innerHTML = lines.map((line, i) => logLineHtml(line, lines[i - 1])).join("");
+  if ($("#logFollow").checked) view.scrollTop = view.scrollHeight;
+}
+
+async function loadLog(full = false) {
+  if (logState.loading) return;
+  logState.loading = true;
+
+  try {
+    const after = full && !logState.lines.length ? 0 : logState.last;
+    const data = await api(`/api/logs?after=${after}&limit=${LOG_KEEP}`);
+
+    // The app restarted: its line numbers start again from 1, so start
+    // over on the next poll.
+    if (data.last < logState.last) {
+      logState.lines = [];
+      logState.last = 0;
+      return;
+    }
+
+    const fresh = data.lines || [];
+    logState.file = data.file;
+
+    if (logState.last) {
+      logState.problems += fresh.filter(l => l.level === "WARNING" || l.level === "ERROR" || l.level === "CRITICAL").length;
+    }
+
+    logState.lines = logState.lines.concat(fresh).slice(-LOG_KEEP);
+    logState.last = data.last;
+
+    $("#logInfo").textContent = logState.file
+      ? `The last ${LOG_KEEP} lines since the app started. Every line is also saved to ${logState.file} (a new file each day, kept 30 days).`
+      : `The last ${LOG_KEEP} lines since the app started.`;
+
+    if (logTabOpen()) {
+      logState.problems = 0;
+      if (fresh.length || full) renderLog();
+    }
+    renderLogBadge();
+  } catch (error) {
+    if (logTabOpen()) $("#logView").innerHTML = `<div class="log-empty">Could not load the log: ${escapeHtml(error.message)}</div>`;
+  } finally {
+    logState.loading = false;
+  }
+}
+
+$("#logProblemsOnly").addEventListener("change", renderLog);
+$("#logFollow").addEventListener("change", () => {
+  if ($("#logFollow").checked) $("#logView").scrollTop = $("#logView").scrollHeight;
+});
+// Scrolling up pauses "Follow"; scrolling back to the bottom resumes it.
+$("#logView").addEventListener("scroll", () => {
+  const view = $("#logView");
+  const atBottom = view.scrollHeight - view.scrollTop - view.clientHeight < 24;
+  if ($("#logFollow").checked !== atBottom) $("#logFollow").checked = atBottom;
+});
 
 
 // ==========================================================
@@ -1674,4 +1779,9 @@ tickClock();
 
 setInterval(pollStatus, 4000);
 setInterval(tickClock, 1000);
+// New log lines: every 2 s while the Log tab is open, otherwise every 10 s
+// (to count new warnings on the tab).
+setInterval(() => { if (logTabOpen()) loadLog(); }, 2000);
+setInterval(() => { if (!logTabOpen()) loadLog(); }, 10000);
+loadLog();
 setInterval(() => { if (!state.busy) loadSchedules(); }, 60000);
