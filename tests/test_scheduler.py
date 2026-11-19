@@ -275,6 +275,45 @@ def test_retry_stops_when_a_retry_succeeds(env):
     assert saved["retry_at"] is None
 
 
+def test_retry_repeats_only_the_failed_steps(env):
+    store, scheduler, downloader, clock, _ = env
+    schedule = store.create(nightly(segments=["CM", "FO", "CD"], days_back=1), clock())
+    downloader.failing_segments = {"FO"}
+
+    clock.value = TUESDAY_2200.replace(hour=23)
+    scheduler.tick()
+    drain(scheduler)
+    assert len(downloader.calls) == 6  # 2 dates x 3 segments
+
+    saved = store.get(schedule["id"])
+    assert saved["retry_dates"] == [["2026-11-16", "FO"], ["2026-11-17", "FO"]]
+
+    downloader.calls.clear()
+    downloader.failing_segments = set()
+    clock.value = datetime(2026, 11, 17, 23, 15)
+    scheduler.tick()
+    drain(scheduler)
+
+    assert [(seg, date) for seg, _, date, _ in downloader.calls] == [
+        ("FO", "16-11-2026"), ("FO", "17-11-2026"),
+    ]
+    saved = store.get(schedule["id"])
+    assert saved["last_status"] == "completed"
+    assert "2 failed date/segment step(s)" in saved["last_summary"]
+
+
+def test_retry_saved_by_older_version_still_runs_every_segment(env):
+    store, scheduler, downloader, clock, _ = env
+    schedule = store.create(nightly(segments=["CM", "FO"], days_back=0), clock())
+    store.set_fields(schedule["id"], retry_at="2026-11-17T22:00:00",
+                     retry_dates=["2026-11-17"], retries_left=1)
+
+    scheduler.tick()
+    drain(scheduler)
+
+    assert [seg for seg, *_ in downloader.calls] == ["CM", "FO"]
+
+
 def test_run_now_queues_only_once(env):
     store, scheduler, downloader, clock, _ = env
     schedule = store.create(nightly(), clock())

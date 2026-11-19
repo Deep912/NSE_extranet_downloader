@@ -50,6 +50,27 @@ def _nse_date(day: date) -> str:
 # STORE
 # --------------------------------------------------
 
+def _retry_steps(schedule: dict) -> list[tuple[date, str]]:
+    """
+    The (date, segment) steps a retry should repeat.
+
+    Saved as [date, segment] pairs; older rows saved plain dates, which
+    mean every segment of the schedule on that date.
+    """
+
+    steps = []
+
+    for entry in schedule.get("retry_dates") or []:
+        if isinstance(entry, str):
+            day = date.fromisoformat(entry)
+            steps.extend((day, segment) for segment in schedule["segments"])
+        else:
+            day, segment = entry
+            steps.append((date.fromisoformat(day), segment))
+
+    return steps
+
+
 class ScheduleStore:
     """Validate and persist schedules (table: schedules)."""
 
@@ -440,10 +461,15 @@ class Scheduler:
 
             if retry_at is not None and now >= retry_at:
                 self.store.set_fields(schedule["id"], retry_at=None)
+                steps = _retry_steps(schedule)
+
+                if not steps:  # nothing recorded to retry
+                    continue
+
                 self._enqueue({
                     "schedule_id": schedule["id"],
                     "kind": "retry",
-                    "dates": [date.fromisoformat(d) for d in schedule["retry_dates"]],
+                    "steps": steps,
                     "retries_left": schedule["retries_left"],
                 })
 
@@ -504,7 +530,6 @@ class Scheduler:
             return None
 
         today = self.now().date()
-        dates = job.get("dates") or self.dates_for(schedule, job["base_date"], today)
 
         def folders_for(segment: str) -> list[str]:
             if schedule["scope"] == "folder":
@@ -514,12 +539,18 @@ class Scheduler:
             return ["/"]
 
         # One run per date and segment; all its folders go in that run.
-        steps = [(day, segment) for day in dates for segment in schedule["segments"]]
+        # A retry repeats only the steps that had problems last time.
+        if job.get("steps"):
+            steps = list(job["steps"])
+        else:
+            dates = self.dates_for(schedule, job["base_date"], today)
+            steps = [(day, segment) for day in dates for segment in schedule["segments"]]
 
         name = schedule["name"]
         totals = {"downloaded": 0, "already": 0, "failed": 0, "errors": 0}
         errors: list[str] = []
         run_ids = []
+        failed_steps = []
         stopped = False
 
         self.store.set_fields(schedule["id"], last_status="waiting")
@@ -551,6 +582,7 @@ class Scheduler:
                     )
                 except Exception as exc:
                     totals["errors"] += 1
+                    failed_steps.append((day, segment))
                     errors.append(f"{segment} {_nse_date(day)}: {exc}")
                     print(f"[Scheduler] {segment} {_nse_date(day)} failed: {exc}", flush=True)
                     continue
@@ -559,6 +591,9 @@ class Scheduler:
                 totals["downloaded"] += result.get("downloaded", 0)
                 totals["already"] += result.get("already_downloaded", 0)
                 totals["failed"] += result.get("failed", 0)
+
+                if result.get("failed", 0):
+                    failed_steps.append((day, segment))
 
                 if result.get("status") == "cancelled":
                     stopped = True
@@ -582,10 +617,14 @@ class Scheduler:
         if stopped:
             prefix = f"Stopped by user · {prefix}"
 
+        if job.get("steps"):
+            scope = f"{len(steps)} failed date/segment step(s)"
+        else:
+            scope = f"{len(dates)} date(s) × {len(schedule['segments'])} segment(s)"
+
         summary = (
             f"{prefix}{totals['downloaded']} new, {totals['already']} already had, "
-            f"{totals['failed'] + totals['errors']} failed · "
-            f"{len(dates)} date(s) × {len(schedule['segments'])} segment(s)"
+            f"{totals['failed'] + totals['errors']} failed · {scope}"
         )
 
         if errors:
@@ -607,13 +646,14 @@ class Scheduler:
         }
 
         # A stopped run is not retried: the user asked it to stop.
-        if status not in ("completed", "cancelled") and retries_left > 0:
+        if status not in ("completed", "cancelled") and retries_left > 0 and failed_steps:
             retry_at = self.now() + timedelta(minutes=schedule["retry_delay_minutes"])
             attempt = schedule["retry_count"] - retries_left + 1
 
             fields.update({
                 "retry_at": _iso(retry_at),
-                "retry_dates": [d.isoformat() for d in dates],
+                # Stored as [date, segment] pairs in the retry_dates column.
+                "retry_dates": [[d.isoformat(), seg] for d, seg in failed_steps],
                 "retries_left": retries_left - 1,
                 "last_summary": f"{summary} · retry {attempt}/{schedule['retry_count']} at {retry_at:%H:%M}",
             })
