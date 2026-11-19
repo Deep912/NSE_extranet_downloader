@@ -276,6 +276,9 @@ function renderAdmin() {
 
   $("#addSchedule").disabled = !state.canEdit;
   $("#addSchedule").title = state.canEdit ? "" : "Only the admin can add schedules.";
+
+  // Admin-only controls (delete, clean up) are hidden for others.
+  document.body.classList.toggle("no-edit", !state.canEdit);
 }
 
 async function loadAdmin() {
@@ -342,6 +345,32 @@ $("#adminForm").addEventListener("submit", async (event) => {
     }
   });
 });
+
+
+// ==========================================================
+// STOP
+// ==========================================================
+
+async function stopCurrent(button) {
+  await withLoading(button, "Stopping…", async () => {
+    try {
+      await api("/api/stop", {});
+      state.stopping = true;
+      toast("Stopping after the current file. Files already downloaded are kept.", "warn", 6000);
+      setMood("worried", "ok, stopping after this file…");
+      $("#downloadTimer").textContent = "Stopping after the current file…";
+    } catch (error) {
+      if (!handleAuthError(error)) toast(error.message, error.status === 409 ? "info" : "bad");
+    }
+  });
+
+  // Keep it disabled until the run actually ends.
+  button.disabled = true;
+  pollStatus();
+}
+
+$("#stopDownload").addEventListener("click", (event) => stopCurrent(event.currentTarget));
+$("#bannerStop").addEventListener("click", (event) => stopCurrent(event.currentTarget));
 
 
 // ==========================================================
@@ -512,6 +541,7 @@ async function loadSegments() {
   $("#browseSegment").innerHTML = options;
   $("#browseSegment").value = state.segments.includes("CM") ? "CM" : state.segments[0];
   $("#runsSegment").innerHTML = `<option value="">All segments</option>${options}`;
+  $("#cSegment").innerHTML = `<option value="">All segments</option>${options}`;
 
   renderCrumbs(state.browsePath);
 }
@@ -656,19 +686,34 @@ async function startDownload() {
   const started = Date.now();
 
   state.localBusy = true;
+  state.stopping = false;
   applyBusy();
 
+  const stopButton = $("#stopDownload");
+  stopButton.classList.remove("hidden");
+  stopButton.disabled = false;
+
   const timer = setInterval(() => {
-    $("#downloadTimer").textContent = `Running for ${seconds((Date.now() - started) / 1000)}…`;
+    if (!state.stopping) {
+      $("#downloadTimer").textContent = `Running for ${seconds((Date.now() - started) / 1000)}…`;
+    }
   }, 1000);
   $("#downloadTimer").textContent = "Starting…";
 
   $("#downloadProgress").innerHTML = segments.map(s => progressRow(s, "waiting")).join("");
 
   const totals = { downloaded: 0, already: 0, failed: 0, errors: 0 };
+  let stopped = false;
 
   await withLoading(button, `Downloading ${segments.length > 1 ? `${segments.length} segments` : segments[0]}…`, async () => {
     for (const segment of segments) {
+      // Stop pressed between segments: don't start the next one.
+      if (stopped || state.stopping) {
+        stopped = true;
+        setRow(segment, progressRow(segment, "cancelled", `<span class="muted small">not started (stopped)</span>`));
+        continue;
+      }
+
       const listFolders = state.lists[segment] || [];
       const where = scope === "list"
         ? `${segment} (${listFolders.length} folder${listFolders.length === 1 ? "" : "s"})`
@@ -696,6 +741,8 @@ async function startDownload() {
         setRow(segment, progressRow(segment, result.status,
           resultBody(result, seconds((Date.now() - segmentStart) / 1000))));
 
+        if (result.status === "cancelled") stopped = true;
+
       } catch (error) {
         totals.errors += 1;
         setRow(segment, progressRow(segment, "failed",
@@ -707,11 +754,19 @@ async function startDownload() {
   });
 
   clearInterval(timer);
-  $("#downloadTimer").textContent = `Finished in ${seconds((Date.now() - started) / 1000)}.`;
+  stopButton.classList.add("hidden");
   state.localBusy = false;
+  state.stopping = false;
   applyBusy();
 
-  if (totals.errors === segments.length) {
+  $("#downloadTimer").textContent = stopped
+    ? `Stopped after ${seconds((Date.now() - started) / 1000)}.`
+    : `Finished in ${seconds((Date.now() - started) / 1000)}.`;
+
+  if (stopped) {
+    setMood("sleep", `stopped. kept ${number(totals.downloaded)} new file(s).`);
+    toast(`Stopped. ${number(totals.downloaded)} new file(s) were kept. Run it again to continue where it left off.`, "warn", 7000);
+  } else if (totals.errors === segments.length) {
     setMood("sad", "couldn't complete any segment. check the errors.");
     toast(`Download for ${date} failed. See the errors under the Download button.`, "bad", 8000);
   } else if (totals.failed || totals.errors) {
@@ -993,6 +1048,7 @@ async function loadRuns() {
     const data = await api("/api/runs?limit=200");
     state.runs = data.runs || [];
     renderRuns();
+    updateDeleteRunButton();
   } catch (error) {
     $("#runs").innerHTML = `<tr><td colspan="11" class="empty-cell note">${escapeHtml(error.message)}</td></tr>`;
   }
@@ -1006,14 +1062,14 @@ async function loadRunFiles() {
   const query = `run_id=${run.id}&limit=500${failedOnly ? "&status=failed" : ""}`;
 
   $("#runFilesTitle").textContent = `Run #${run.id} · ${run.segment} · ${run.exchange_date || ""}`;
-  $("#runFileRows").innerHTML = `<tr><td colspan="5" class="empty-cell"><span class="spinner"></span>Loading files…</td></tr>`;
+  $("#runFileRows").innerHTML = `<tr><td colspan="6" class="empty-cell"><span class="spinner"></span>Loading files…</td></tr>`;
 
   try {
     const data = await api(`/api/downloads?${query}`);
     const files = data.downloads || [];
 
     const folderNote = run.folders_failed
-      ? `<tr><td colspan="5" class="note">${escapeHtml(run.error_message)}</td></tr>` : "";
+      ? `<tr><td colspan="6" class="note">${escapeHtml(run.error_message)}</td></tr>` : "";
 
     $("#runFilesTitle").textContent =
       `Run #${run.id} · ${run.segment} · ${run.exchange_date || ""} · ${files.length} file(s)`;
@@ -1027,13 +1083,16 @@ async function loadRunFiles() {
         <td class="note">${f.status !== "failed"
           ? `<a class="save-link" href="/api/downloads/${f.id}/file" download title="Save a copy to this PC">Save copy</a>`
           : escapeHtml(f.error_message || "")}</td>
+        <td class="num admin-only">
+          <button type="button" class="danger row-x" data-delete-file="${f.id}" data-name="${escapeHtml(f.file_name)}" title="Delete this record">✕</button>
+        </td>
       </tr>`).join("")
-      : `<tr><td colspan="5" class="empty-cell">${failedOnly
+      : `<tr><td colspan="6" class="empty-cell">${failedOnly
           ? "No failed files in this run."
           : "No files recorded for this run. Each file shows the latest run that processed it."}</td></tr>`);
 
   } catch (error) {
-    $("#runFileRows").innerHTML = `<tr><td colspan="5" class="empty-cell note">${escapeHtml(error.message)}</td></tr>`;
+    $("#runFileRows").innerHTML = `<tr><td colspan="6" class="empty-cell note">${escapeHtml(error.message)}</td></tr>`;
   }
 }
 
@@ -1043,7 +1102,158 @@ $("#runs").addEventListener("click", (event) => {
 
   state.selectedRun = Number(row.dataset.run);
   $$("#runs tr").forEach(tr => tr.classList.toggle("selected", tr === row));
+  updateDeleteRunButton();
   loadRunFiles();
+});
+
+function updateDeleteRunButton() {
+  const run = state.runs.find(r => r.id === state.selectedRun);
+  $("#deleteRunBtn").disabled = !run || run.status === "running";
+}
+
+
+// ---------- delete confirmation ----------
+
+let pendingDelete = null;
+
+function openDeleteDialog({ title, message, action }) {
+  pendingDelete = action;
+  $("#deleteTitle").textContent = title;
+  $("#deleteMessage").textContent = message;
+  $("#deleteFiles").checked = false;
+  $("#deleteError").textContent = "";
+  $("#deleteDialog").showModal();
+}
+
+function describeRemoved(result) {
+  const parts = [];
+  if (result.runs) parts.push(`${result.runs} run(s)`);
+  parts.push(`${result.file_records} file record(s)`);
+  let text = `Deleted ${parts.join(" and ")}`;
+  if (result.files) {
+    text += `, ${result.files.deleted} file(s) removed from disk (${fileSize(result.files.bytes)})`;
+    if (result.files.missing) text += `, ${result.files.missing} already missing`;
+  }
+  return `${text}.`;
+}
+
+$("#deleteCancel").addEventListener("click", () => $("#deleteDialog").close());
+
+$("#deleteForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!pendingDelete) return;
+
+  await withLoading($("#deleteConfirm"), "Deleting…", async () => {
+    try {
+      const result = await pendingDelete($("#deleteFiles").checked);
+      $("#deleteDialog").close();
+      toast(describeRemoved(result), "good", 6000);
+      await loadRuns();
+      if (state.runs.some(r => r.id === state.selectedRun)) {
+        loadRunFiles();
+      } else {
+        state.selectedRun = null;
+        updateDeleteRunButton();
+        $("#runFilesTitle").textContent = "Files";
+        $("#runFileRows").innerHTML = `<tr><td colspan="6" class="empty-cell">Click a run above to see its files.</td></tr>`;
+      }
+    } catch (error) {
+      $("#deleteError").textContent = error.message;
+      if (error.status === 401) refreshRights();
+    }
+  });
+});
+
+$("#deleteRunBtn").addEventListener("click", () => {
+  const run = state.runs.find(r => r.id === state.selectedRun);
+  if (!run) return;
+
+  openDeleteDialog({
+    title: `Delete run #${run.id}?`,
+    message: `${run.segment} · ${run.exchange_date || ""} · ${runScope(run)}. ` +
+      "The run and the file records it last updated are removed from history.",
+    action: (deleteFiles) => api(`/api/runs/${run.id}?delete_files=${deleteFiles}`, undefined, "DELETE"),
+  });
+});
+
+$("#runFileRows").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-delete-file]");
+  if (!button) return;
+
+  openDeleteDialog({
+    title: "Delete file record?",
+    message: `${button.dataset.name}: the record is removed from history.`,
+    action: (deleteFiles) => api(`/api/downloads/${button.dataset.deleteFile}?delete_files=${deleteFiles}`, undefined, "DELETE"),
+  });
+});
+
+
+// ---------- clean up ----------
+
+function cleanupPayload(dryRun) {
+  return {
+    segment: $("#cSegment").value || null,
+    date_from: $("#cFrom").value,
+    date_to: $("#cTo").value,
+    delete_files: $("#cFiles").checked,
+    dry_run: dryRun,
+  };
+}
+
+function resetCleanupPreview() {
+  $("#cDelete").disabled = true;
+  $("#cPreview").textContent = "Press “Preview” to see what would be deleted.";
+}
+
+$("#cleanupBtn").addEventListener("click", () => {
+  if (!$("#cFrom").value) $("#cFrom").value = localIsoDate(-30);
+  if (!$("#cTo").value) $("#cTo").value = localIsoDate(-7);
+  $("#cError").textContent = "";
+  resetCleanupPreview();
+  $("#cleanupDialog").showModal();
+});
+
+["#cSegment", "#cFrom", "#cTo", "#cFiles"].forEach(id =>
+  $(id).addEventListener("change", resetCleanupPreview));
+
+$("#cCancel").addEventListener("click", () => $("#cleanupDialog").close());
+
+$("#cPreviewBtn").addEventListener("click", (event) =>
+  withLoading(event.currentTarget, "Checking…", async () => {
+    $("#cError").textContent = "";
+    try {
+      const preview = await api("/api/history/cleanup", cleanupPayload(true));
+      const files = $("#cFiles").checked
+        ? ` and <b>${number(preview.files_on_record)}</b> file(s) on disk (about ${escapeHtml(fileSize(preview.bytes))})`
+        : "";
+      $("#cPreview").innerHTML = (preview.runs || preview.file_records)
+        ? `Will delete <b>${number(preview.runs)}</b> run(s), <b>${number(preview.file_records)}</b> file record(s)${files}.`
+        : "Nothing matches. Nothing will be deleted.";
+      $("#cDelete").disabled = !(preview.runs || preview.file_records);
+    } catch (error) {
+      $("#cError").textContent = error.message;
+      if (error.status === 401) refreshRights();
+    }
+  })
+);
+
+$("#cleanupForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+
+  await withLoading($("#cDelete"), "Deleting…", async () => {
+    try {
+      const result = await api("/api/history/cleanup", cleanupPayload(false));
+      $("#cleanupDialog").close();
+      toast(describeRemoved(result), "good", 7000);
+      state.selectedRun = null;
+      updateDeleteRunButton();
+      loadRuns();
+    } catch (error) {
+      $("#cError").textContent = error.message;
+    }
+  });
+
+  $("#cDelete").disabled = true;
 });
 
 $("#failedOnly").addEventListener("change", loadRunFiles);
@@ -1088,7 +1298,17 @@ async function pollStatus() {
 
   if (status.busy && status.current) {
     const label = status.current.kind === "scheduled" ? "Scheduled run" : "NSE in use";
-    $("#busyText").textContent = `${label}: ${status.current.description}`;
+    $("#busyText").textContent = status.current.stopping
+      ? `Stopping after the current file: ${status.current.description}`
+      : `${label}: ${status.current.description}`;
+
+    // Stopping a scheduled run needs the admin (when one is set).
+    const stopBtn = $("#bannerStop");
+    const allowed = status.current.kind !== "scheduled" || state.canEdit;
+    if (!stopBtn.classList.contains("loading")) {
+      stopBtn.disabled = !allowed || Boolean(status.current.stopping);
+    }
+    stopBtn.title = allowed ? "Stop after the current file" : "Only the admin can stop a scheduled run.";
   }
 
   if (remote !== wasRemote) {

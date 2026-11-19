@@ -27,7 +27,7 @@ from app.services.scheduler import (
 
 BASE_DIR = Path(__file__).resolve().parent
 
-downloader = DownloaderService()
+downloader = DownloaderService(should_stop=activity.stop_requested)
 catalogue_service = FolderCatalogueService()
 schedule_store = ScheduleStore()
 folder_lists = FolderListStore()
@@ -891,3 +891,129 @@ def get_downloaded_file(download_id: int):
         raise HTTPException(status_code=404, detail="The saved file is missing.")
 
     return FileResponse(path, filename=path.name, media_type="application/octet-stream")
+
+
+# --------------------------------------------------
+# STOP A RUNNING DOWNLOAD
+# --------------------------------------------------
+
+@app.post("/api/stop")
+def stop_current(request: Request):
+    """
+    Ask the running download to stop after the current file or folder
+    listing. Files already downloaded are kept. Stopping a scheduled run
+    needs the admin (if one is set).
+    """
+
+    current = activity.status()
+
+    if current is None:
+        raise HTTPException(status_code=409, detail="Nothing is running.")
+
+    if current.get("kind") == "scheduled":
+        require_admin(request)
+
+    status = activity.request_stop()
+
+    if status is None:  # finished in the meantime
+        raise HTTPException(status_code=409, detail="Nothing is running.")
+
+    return {"stopping": True, "current": status}
+
+
+# --------------------------------------------------
+# DELETE HISTORY (admin)
+# --------------------------------------------------
+
+def _not_while_busy() -> None:
+    if activity.status() is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="A download is running. Stop it or wait until it finishes before deleting history.",
+        )
+
+
+def _finish_delete(removed: dict, delete_files: bool) -> dict:
+    files = (
+        downloader.remove_local_files(removed["local_paths"])
+        if delete_files else None
+    )
+
+    return {
+        "runs": removed["runs"],
+        "file_records": removed["file_records"],
+        "files": files,
+    }
+
+
+@app.delete("/api/runs/{run_id}")
+def delete_run(run_id: int, request: Request, delete_files: bool = False):
+    require_admin(request)
+    _not_while_busy()
+
+    try:
+        removed = downloader.history.delete_run(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    if removed is None:
+        raise HTTPException(status_code=404, detail="Run not found.")
+
+    return _finish_delete(removed, delete_files)
+
+
+@app.delete("/api/downloads/{download_id}")
+def delete_download_record(download_id: int, request: Request, delete_files: bool = False):
+    require_admin(request)
+    _not_while_busy()
+
+    removed = downloader.history.delete_file_record(download_id)
+
+    if removed is None:
+        raise HTTPException(status_code=404, detail="File record not found.")
+
+    return _finish_delete(removed, delete_files)
+
+
+@app.post("/api/history/cleanup")
+def cleanup_history(payload: dict, request: Request):
+    """
+    Delete runs and file records for a segment (or all) and an exchange
+    date range. Send dry_run=true first to see what would be removed.
+    """
+
+    require_admin(request)
+
+    segment = payload.get("segment") or None
+    if segment is not None:
+        segment = validate_segment(segment)
+
+    try:
+        date_from = datetime.strptime(str(payload.get("date_from", "")), "%Y-%m-%d").date()
+        date_to = datetime.strptime(str(payload.get("date_to", "")), "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Dates must use YYYY-MM-DD.") from exc
+
+    if date_from > date_to:
+        raise HTTPException(status_code=400, detail="The start date is after the end date.")
+
+    dry_run = bool(payload.get("dry_run", True))
+    delete_files = bool(payload.get("delete_files", False))
+
+    if not dry_run:
+        _not_while_busy()
+
+    removed = downloader.history.cleanup(
+        segment, date_from.isoformat(), date_to.isoformat(), dry_run=dry_run
+    )
+
+    if dry_run:
+        return {
+            "dry_run": True,
+            "runs": removed["runs"],
+            "file_records": removed["file_records"],
+            "files_on_record": len(removed["local_paths"]),
+            "bytes": removed["bytes"],
+        }
+
+    return {"dry_run": False, **_finish_delete(removed, delete_files)}

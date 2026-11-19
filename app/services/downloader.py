@@ -19,6 +19,10 @@ MAX_FOLDER_DEPTH = 20
 MAX_FOLDERS_PER_ROOT = 2000
 
 
+class DownloadCancelled(Exception):
+    """Raised at a safe point when the user asked the run to stop."""
+
+
 class DownloaderService:
     """Coordinates recursive, date-filtered NSE file downloads."""
 
@@ -28,6 +32,7 @@ class DownloaderService:
         catalogue_service=None,
         client_factory=None,
         history=None,
+        should_stop=None,
     ):
         self.download_root = Path(download_root)
         self.catalogue_service = (
@@ -35,6 +40,8 @@ class DownloaderService:
         )
         self.client_factory = client_factory or NSEExtranetClient
         self.history = history or DownloadHistory()
+        # Called at safe points; returns True when the user pressed Stop.
+        self.should_stop = should_stop or (lambda: False)
 
     @staticmethod
     def _validate_date(exchange_date: str) -> str:
@@ -382,6 +389,10 @@ class DownloaderService:
                     )
 
                     while pending:
+                        # Safe point: stop before listing another folder.
+                        if self.should_stop():
+                            raise DownloadCancelled()
+
                         current_path, depth = pending.pop()
 
                         if current_path in visited:
@@ -562,6 +573,10 @@ class DownloaderService:
                                 })
                                 continue
 
+                            # Safe point: stop before downloading another file.
+                            if self.should_stop():
+                                raise DownloadCancelled()
+
                             print(
                                 f"[NSE] Downloading "
                                 f"{segment}/{current_path}{filename}",
@@ -668,6 +683,29 @@ class DownloaderService:
                         flush=True,
                     )
 
+        except DownloadCancelled:
+            # Stopped by the user: keep what was downloaded so far.
+            result["status"] = "cancelled"
+            result["stopped"] = True
+
+            self.history.finish_run(
+                run_id,
+                status="cancelled",
+                files_found=result["matching_files"],
+                files_downloaded=result["downloaded"],
+                files_skipped=result["already_downloaded"],
+                files_failed=result["failed_files"],
+                folders_failed=len(result["failed_folders"]),
+                error_message="Stopped by user.",
+            )
+
+            print(
+                f"[NSE] Download run {run_id} stopped by user after "
+                f"{result['downloaded']} new file(s).",
+                flush=True,
+            )
+            return result
+
         except Exception as exc:
             # Do not leave the run marked as 'running'.
             self.history.finish_run(
@@ -748,6 +786,47 @@ class DownloaderService:
             exchange_date=date,
             mode=mode,
         )
+
+    def remove_local_files(self, paths: list[str]) -> dict:
+        """
+        Delete downloaded files from disk, then remove folders left empty.
+
+        Only files inside the download folder are touched; anything else is
+        counted as skipped and left alone.
+        """
+
+        root = self.download_root.resolve()
+        counts = {"deleted": 0, "missing": 0, "skipped": 0, "bytes": 0}
+        parents = set()
+
+        for raw in dict.fromkeys(paths):
+            path = Path(raw).resolve()
+
+            if not path.is_relative_to(root) or path == root:
+                counts["skipped"] += 1
+                continue
+
+            if not path.is_file():
+                counts["missing"] += 1
+                continue
+
+            counts["bytes"] += path.stat().st_size
+            path.unlink()
+            counts["deleted"] += 1
+            parents.add(path.parent)
+
+        # Remove empty folders, deepest first, never the download root.
+        for folder in sorted(parents, key=lambda p: len(p.parts), reverse=True):
+            current = folder
+
+            while current != root and current.is_relative_to(root):
+                try:
+                    current.rmdir()  # only succeeds when empty
+                except OSError:
+                    break
+                current = current.parent
+
+        return counts
 
     def download_folders(
         self,
@@ -1021,6 +1100,9 @@ class DownloaderService:
                 total_failed += segment_result["failed"]
 
                 results.append(segment_result)
+
+                if segment_result.get("status") == "cancelled":
+                    break  # stopped by the user: skip remaining segments
 
             except Exception as exc:
                 total_failed += 1

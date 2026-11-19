@@ -520,6 +520,7 @@ class Scheduler:
         totals = {"downloaded": 0, "already": 0, "failed": 0, "errors": 0}
         errors: list[str] = []
         run_ids = []
+        stopped = False
 
         self.store.set_fields(schedule["id"], last_status="waiting")
 
@@ -531,6 +532,10 @@ class Scheduler:
             )
 
             for number, (day, segment) in enumerate(steps, start=1):
+                if self.activity.stop_requested():
+                    stopped = True
+                    break
+
                 self.activity.update(
                     f"{name}: {segment} {_nse_date(day)} ({number}/{len(steps)})"
                 )
@@ -555,7 +560,13 @@ class Scheduler:
                 totals["already"] += result.get("already_downloaded", 0)
                 totals["failed"] += result.get("failed", 0)
 
-        if totals["errors"] == len(steps):
+                if result.get("status") == "cancelled":
+                    stopped = True
+                    break
+
+        if stopped:
+            status = "cancelled"
+        elif totals["errors"] == len(steps):
             status = "failed"
         elif totals["failed"] or totals["errors"]:
             status = "partial"
@@ -567,6 +578,9 @@ class Scheduler:
             "retry": "Retry: ",
             "manual": "Run now: ",
         }.get(job["kind"], "")
+
+        if stopped:
+            prefix = f"Stopped by user · {prefix}"
 
         summary = (
             f"{prefix}{totals['downloaded']} new, {totals['already']} already had, "
@@ -592,7 +606,8 @@ class Scheduler:
             "retries_left": 0,
         }
 
-        if status != "completed" and retries_left > 0:
+        # A stopped run is not retried: the user asked it to stop.
+        if status not in ("completed", "cancelled") and retries_left > 0:
             retry_at = self.now() + timedelta(minutes=schedule["retry_delay_minutes"])
             attempt = schedule["retry_count"] - retries_left + 1
 

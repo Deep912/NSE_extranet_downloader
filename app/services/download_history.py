@@ -158,6 +158,119 @@ class DownloadHistory:
             for row in rows
         }
 
+    # ---------- deleting history ----------
+
+    # exchange_date is stored as DD-MM-YYYY; this turns it into YYYY-MM-DD
+    # so date ranges compare correctly.
+    @staticmethod
+    def _iso(column: str) -> str:
+        return (
+            f"(substr({column}, 7, 4) || '-' || substr({column}, 4, 2)"
+            f" || '-' || substr({column}, 1, 2))"
+        )
+
+    def delete_run(self, run_id: int) -> dict | None:
+        """
+        Delete one run and the file records it last updated.
+
+        Returns what was removed (including the local paths of those files,
+        so the caller can delete them from disk), or None if not found.
+        """
+
+        with self._connect() as conn:
+            run = conn.execute(
+                "SELECT * FROM download_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+
+            if run is None:
+                return None
+
+            if run["status"] == "running":
+                raise ValueError("This run is still running. Stop it first.")
+
+            files = conn.execute(
+                "SELECT id, local_path FROM downloads WHERE run_id = ?", (run_id,)
+            ).fetchall()
+
+            conn.execute("DELETE FROM downloads WHERE run_id = ?", (run_id,))
+            conn.execute("DELETE FROM download_runs WHERE id = ?", (run_id,))
+
+        return {
+            "runs": 1,
+            "file_records": len(files),
+            "local_paths": [f["local_path"] for f in files if f["local_path"]],
+        }
+
+    def delete_file_record(self, download_id: int) -> dict | None:
+        """Delete one file record. Returns it (with local_path) or None."""
+
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM downloads WHERE id = ?", (download_id,)
+            ).fetchone()
+
+            if row is None:
+                return None
+
+            conn.execute("DELETE FROM downloads WHERE id = ?", (download_id,))
+
+        return {
+            "runs": 0,
+            "file_records": 1,
+            "local_paths": [row["local_path"]] if row["local_path"] else [],
+            "file_name": row["file_name"],
+        }
+
+    def cleanup(
+        self,
+        segment: str | None,
+        date_from: str,
+        date_to: str,
+        dry_run: bool = True,
+    ) -> dict:
+        """
+        Delete runs and file records for exchange dates in a range.
+
+        date_from / date_to are YYYY-MM-DD (inclusive). segment None = all.
+        With dry_run, nothing is deleted and the counts are a preview.
+        Running runs are never deleted.
+        """
+
+        conditions = [f"{self._iso('exchange_date')} BETWEEN ? AND ?"]
+        params: list = [date_from, date_to]
+
+        if segment:
+            conditions.append("segment = ?")
+            params.append(segment)
+
+        where = " AND ".join(conditions)
+
+        with self._connect() as conn:
+            runs = conn.execute(
+                f"SELECT id FROM download_runs WHERE {where} AND status != 'running'",
+                params,
+            ).fetchall()
+
+            files = conn.execute(
+                f"SELECT id, local_path, file_size FROM downloads WHERE {where}",
+                params,
+            ).fetchall()
+
+            if not dry_run:
+                conn.execute(f"DELETE FROM downloads WHERE {where}", params)
+                conn.execute(
+                    f"DELETE FROM download_runs WHERE {where} AND status != 'running'",
+                    params,
+                )
+
+        return {
+            "dry_run": dry_run,
+            "runs": len(runs),
+            "file_records": len(files),
+            "local_paths": [f["local_path"] for f in files if f["local_path"]],
+            "bytes": sum(f["file_size"] or 0 for f in files),
+        }
+
     def get_file_record(self, download_id: int) -> dict | None:
         """One row of the downloads table, or None."""
 

@@ -31,6 +31,7 @@
     <div class="banner hidden" id="busyBanner" role="status">
       <span class="dot"></span>
       <span id="busyText">NSE is busy.</span>
+      <button type="button" class="danger small-btn banner-stop" id="bannerStop">■ Stop</button>
     </div>
 
     <main class="layout">
@@ -78,7 +79,10 @@
             <input id="scopeFolder" type="text" value="/Reports" spellcheck="false" autocomplete="off">
           </div>
 
-          <button id="startDownload" class="primary wide" type="button">Download</button>
+          <div class="download-actions">
+            <button id="startDownload" class="primary wide" type="button">Download</button>
+            <button id="stopDownload" class="danger stop-btn hidden" type="button" title="Stop after the current file. Files already downloaded are kept.">■ Stop</button>
+          </div>
           <p class="muted small center" id="downloadTimer">Files you already have are skipped.</p>
 
           <ul class="progress" id="downloadProgress"></ul>
@@ -115,6 +119,7 @@
               <option value="">All segments</option>
             </select>
             <label class="toggle"><input type="checkbox" id="problemsOnly"> Problems only</label>
+            <button id="cleanupBtn" class="secondary admin-only" type="button" title="Delete history for a segment and date range">Clean up…</button>
             <button id="refreshRuns" class="secondary" type="button">Refresh</button>
           </div>
         </div>
@@ -141,13 +146,16 @@
           <div class="pane">
             <div class="pane-head">
               <h3 id="runFilesTitle">Files</h3>
-              <label class="toggle"><input type="checkbox" id="failedOnly"> Failed only</label>
+              <div class="head-tools">
+                <label class="toggle"><input type="checkbox" id="failedOnly"> Failed only</label>
+                <button id="deleteRunBtn" class="danger small-btn admin-only" type="button" disabled>Delete run…</button>
+              </div>
             </div>
             <div class="table-wrap scroll">
               <table>
-                <thead><tr><th>File</th><th>Folder</th><th>Status</th><th class="num">Size</th><th>Note</th></tr></thead>
+                <thead><tr><th>File</th><th>Folder</th><th>Status</th><th class="num">Size</th><th>Note</th><th class="admin-only"></th></tr></thead>
                 <tbody id="runFileRows">
-                  <tr><td colspan="5" class="empty-cell">Click a run above to see its files.</td></tr>
+                  <tr><td colspan="6" class="empty-cell">Click a run above to see its files.</td></tr>
                 </tbody>
               </table>
             </div>
@@ -275,6 +283,60 @@
       <div class="actions end">
         <button type="button" class="secondary" id="sCancel">Cancel</button>
         <button type="submit" class="primary" id="sSave">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Delete confirmation -->
+  <dialog id="deleteDialog" class="small-dialog" aria-labelledby="deleteTitle">
+    <form id="deleteForm" method="dialog" novalidate>
+      <h2 id="deleteTitle">Delete</h2>
+      <p id="deleteMessage"></p>
+      <label class="check">
+        <input type="checkbox" id="deleteFiles">
+        <span>Also delete the downloaded files from this PC. Without this, only the history records are removed and the next run checks those files again.</span>
+      </label>
+      <p class="form-error" id="deleteError" role="alert"></p>
+      <div class="actions end">
+        <button type="button" class="secondary" id="deleteCancel">Cancel</button>
+        <button type="submit" class="danger solid" id="deleteConfirm">Delete</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Clean up history -->
+  <dialog id="cleanupDialog" aria-labelledby="cleanupTitle">
+    <form id="cleanupForm" method="dialog" novalidate>
+      <h2 id="cleanupTitle">Clean up history</h2>
+      <p class="muted small">Delete runs and file records for an exchange date range, for example to redo a day or remove old history.</p>
+
+      <div class="form-grid three">
+        <div>
+          <label for="cSegment">Segment</label>
+          <select id="cSegment"><option value="">All segments</option></select>
+        </div>
+        <div>
+          <label for="cFrom">From</label>
+          <input id="cFrom" type="date">
+        </div>
+        <div>
+          <label for="cTo">To</label>
+          <input id="cTo" type="date">
+        </div>
+      </div>
+
+      <label class="check">
+        <input type="checkbox" id="cFiles">
+        <span>Also delete the downloaded files from this PC.</span>
+      </label>
+
+      <div class="preview-box" id="cPreview">Press “Preview” to see what would be deleted.</div>
+      <p class="form-error" id="cError" role="alert"></p>
+
+      <div class="actions end">
+        <button type="button" class="secondary" id="cCancel">Cancel</button>
+        <button type="button" class="secondary" id="cPreviewBtn">Preview</button>
+        <button type="submit" class="danger solid" id="cDelete" disabled>Delete</button>
       </div>
     </form>
   </dialog>

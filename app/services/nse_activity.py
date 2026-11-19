@@ -33,10 +33,30 @@ class NSEActivity:
     def __init__(self):
         self._lock = threading.Lock()
         self._current: dict | None = None
+        self._stop = threading.Event()
 
     def status(self) -> dict | None:
         current = self._current
         return dict(current) if current else None
+
+    def request_stop(self) -> dict | None:
+        """
+        Ask the running activity to stop at its next safe point (after the
+        current file or folder listing). Returns its status, or None if
+        nothing is running.
+        """
+
+        current = self._current
+
+        if current is None:
+            return None
+
+        self._stop.set()
+        current["stopping"] = True
+        return dict(current)
+
+    def stop_requested(self) -> bool:
+        return self._stop.is_set()
 
     def update(self, description: str) -> None:
         """Change the description of the running activity (progress)."""
@@ -46,16 +66,19 @@ class NSEActivity:
 
     @contextmanager
     def _held(self, description: str, kind: str):
+        self._stop.clear()
         self._current = {
             "description": description,
             "kind": kind,
             "started_at": datetime.now().isoformat(timespec="seconds"),
+            "stopping": False,
         }
 
         try:
             yield self
         finally:
             self._current = None
+            self._stop.clear()
             self._lock.release()
 
     @contextmanager
