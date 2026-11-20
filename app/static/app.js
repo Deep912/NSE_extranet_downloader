@@ -250,6 +250,8 @@ function applyBusy() {
   ).forEach(element => {
     if (!element.classList.contains("loading")) element.disabled = busy;
   });
+
+  updateDeleteRunButton();
 }
 
 
@@ -1110,6 +1112,8 @@ function runScope(run) {
   return roots.join(", ");
 }
 
+const MODE_TAGS = { scheduled: "scheduled", list: "folder list", file: "single file", retry: "retry" };
+
 function runFailed(run) {
   return (run.files_failed || 0) + (run.folders_failed || 0);
 }
@@ -1133,8 +1137,7 @@ function renderRuns() {
         <td>${escapeHtml(run.exchange_date || "—")}</td>
         <td><b>${escapeHtml(run.segment)}</b></td>
         <td class="file-name">${escapeHtml(runScope(run))}${
-          { scheduled: "scheduled", list: "folder list", file: "single file" }[run.mode]
-            ? `<span class="tag">${{ scheduled: "scheduled", list: "folder list", file: "single file" }[run.mode]}</span>` : ""}</td>
+          MODE_TAGS[run.mode] ? `<span class="tag">${MODE_TAGS[run.mode]}</span>` : ""}</td>
         <td><span class="badge ${escapeHtml(run.status)}">${escapeHtml(run.status)}</span></td>
         <td class="num">${number(run.files_found)}</td>
         <td class="num">${number(run.files_downloaded)}</td>
@@ -1159,6 +1162,16 @@ async function loadRuns() {
   }
 }
 
+// Failed folders with their reasons (runs from before this was saved: null).
+function runFolderFailures(run) {
+  try {
+    const list = JSON.parse(run.failed_folders || "null");
+    return Array.isArray(list) && list.length ? list : null;
+  } catch {
+    return null;
+  }
+}
+
 async function loadRunFiles() {
   const run = state.runs.find(r => r.id === state.selectedRun);
   if (!run) return;
@@ -1173,8 +1186,19 @@ async function loadRunFiles() {
     const data = await api(`/api/downloads?${query}`);
     const files = data.downloads || [];
 
-    const folderNote = run.folders_failed
-      ? `<tr><td colspan="6" class="note">${escapeHtml(run.error_message)}</td></tr>` : "";
+    const folders = runFolderFailures(run);
+    const folderNote = folders
+      ? folders.map(f => `
+        <tr class="folder-fail">
+          <td class="file-name">/${escapeHtml(String(f.folder_path || "").replace(/\/$/, ""))}</td>
+          <td class="muted">folder</td>
+          <td><span class="badge failed">failed</span></td>
+          <td class="num">—</td>
+          <td class="note">${escapeHtml(f.error || "")}</td>
+          <td class="admin-only"></td>
+        </tr>`).join("")
+      : run.folders_failed
+        ? `<tr><td colspan="6" class="note">${escapeHtml(run.error_message)}</td></tr>` : "";
 
     $("#runFilesTitle").textContent =
       `Run #${run.id} · ${run.segment} · ${run.exchange_date || ""} · ${files.length} file(s)`;
@@ -1214,7 +1238,53 @@ $("#runs").addEventListener("click", (event) => {
 function updateDeleteRunButton() {
   const run = state.runs.find(r => r.id === state.selectedRun);
   $("#deleteRunBtn").disabled = !run || run.status === "running";
+
+  const retry = $("#retryRunBtn");
+  if (!retry.classList.contains("loading")) {
+    retry.disabled = !run || run.status === "running" || !runFailed(run) || state.busy;
+  }
 }
+
+
+// ---------- retry failed ----------
+
+async function retryRun() {
+  const run = state.runs.find(r => r.id === state.selectedRun);
+  if (!run || state.busy) return;
+
+  state.localBusy = true;
+  applyBusy();
+  setMood("work", `retrying what failed in run #${run.id}…`);
+
+  await withLoading($("#retryRunBtn"), "Retrying…", async () => {
+    try {
+      const result = await api(`/api/runs/${run.id}/retry`, {});
+      const stillFailed = result.failed || 0;
+
+      toast(
+        `Retry of run #${run.id} (new run #${result.run_id}): ${number(result.downloaded)} new, ` +
+        `${number(result.already_downloaded)} already had, ${number(stillFailed)} still failed.`,
+        stillFailed ? "warn" : "good", 8000,
+      );
+      setMood(stillFailed ? "worried" : "happy",
+        stillFailed ? "some still failed. NSE may need a few minutes." : "all fixed now.");
+
+      await loadRuns();
+      state.selectedRun = result.run_id;
+      renderRuns();
+      loadRunFiles();
+
+    } catch (error) {
+      toast(`Retry of run #${run.id}: ${error.message}`, error.status === 409 ? "warn" : "bad", 8000);
+      setMood("worried", "the retry didn't go through.");
+    }
+  });
+
+  state.localBusy = false;
+  applyBusy();
+}
+
+$("#retryRunBtn").addEventListener("click", retryRun);
 
 
 // ---------- delete confirmation ----------

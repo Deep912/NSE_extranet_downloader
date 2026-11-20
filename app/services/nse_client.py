@@ -222,11 +222,39 @@ class NSEExtranetClient:
                 f"(HTTP {response.status_code}): {exc}"
             )
 
-    # Transient failures worth retrying: timeouts, dropped connections
-    # and gateway errors. NSE API errors (704, 706, 712, 714, ...) and
-    # other HTTP errors are returned to the caller without retrying.
+    # Transient failures worth retrying: timeouts, dropped connections,
+    # gateway errors and NSE's "technical error" (HTTP 500, code 605).
+    # Other NSE API errors (704, 706, 712, 714, ...) and HTTP errors are
+    # returned to the caller without retrying.
     RETRY_DELAYS_SECONDS = (2, 5)
     RETRYABLE_STATUS_CODES = {502, 503, 504}
+    RETRYABLE_NSE_CODES = {"605"}
+
+    def _transient_reason(self, response: httpx.Response) -> str | None:
+        """Why this response is worth retrying, or None if it is not."""
+
+        status = response.status_code
+
+        if status in self.RETRYABLE_STATUS_CODES:
+            return f"HTTP {status}"
+
+        if status == 500:
+            try:
+                payload = response.json()
+            except ValueError:
+                return "HTTP 500"  # no NSE code: a server error page
+
+            codes = self._codes(payload) if isinstance(payload, dict) else []
+
+            if not codes:
+                return "HTTP 500"
+
+            retryable = [code for code in codes if code in self.RETRYABLE_NSE_CODES]
+
+            if retryable:
+                return f"HTTP 500 (code {retryable[0]})"
+
+        return None
 
     def _get_with_retry(
         self,
@@ -273,12 +301,16 @@ class NSEExtranetClient:
                 ) from exc
 
             else:
-                if response.status_code not in self.RETRYABLE_STATUS_CODES:
+                reason = self._transient_reason(response)
+
+                if reason is None:
                     return response
 
-                reason = f"HTTP {response.status_code}"
-
                 if attempt == attempts:
+                    # Let the caller report NSE's own error code.
+                    if response.status_code == 500:
+                        return response
+
                     raise NSEAPIError(
                         f"NSE returned {reason} for {description} "
                         f"after {attempts} attempts"

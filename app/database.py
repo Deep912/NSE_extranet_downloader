@@ -177,6 +177,8 @@ def init_db(database_path: Path | None = None):
             "roots": "TEXT",
             "files_failed": "INTEGER DEFAULT 0",
             "folders_failed": "INTEGER DEFAULT 0",
+            # JSON list of {"folder_path", "error"} for folders that failed.
+            "failed_folders": "TEXT",
         })
 
         # -------------------------------------------------

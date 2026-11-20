@@ -674,6 +674,9 @@ dialog::backdrop { background: rgba(10, 12, 18, .45); }
 
 .browse-body > .table-wrap { min-height: 0; }
 
+/* Failed folder rows in a run's file list */
+.folder-fail .file-name::before { content: "\1F4C1  "; }
+
 /* Log tab */
 .log-view {
   flex: 1;

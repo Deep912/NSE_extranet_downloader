@@ -296,7 +296,8 @@ def list_runs(limit: int = 50):
                 files_skipped,
                 files_failed,
                 folders_failed,
-                error_message
+                error_message,
+                failed_folders
             FROM download_runs
             ORDER BY id DESC
             LIMIT ?
@@ -887,6 +888,27 @@ def nse_download_file(payload: dict):
 
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"Could not save the file: {exc}") from exc
+
+
+@app.post("/api/runs/{run_id}/retry")
+def retry_run(run_id: int):
+    """Download again only the folders and files that failed in a run."""
+
+    try:
+        with nse_session(f"Retrying failed items of run #{run_id}"):
+            return downloader.retry_run(run_id)
+
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    except NSEAPIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not save downloaded files: {exc}") from exc
 
 
 @app.get("/api/downloads/{download_id}/file")

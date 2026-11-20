@@ -316,9 +316,14 @@ class DownloaderService:
         selected_paths: list[tuple[str, str]],
         exchange_date: str,
         mode: str = "folder",
+        file_filter: dict[str, set[str]] | None = None,
     ) -> dict:
         """
         Recursively list selected folders and download matching files.
+
+        file_filter (used by retry_run) maps a selected folder to the file
+        names wanted from it: that folder is listed on its own, without
+        its subfolders, and only those files are considered.
 
         Each selected_paths entry contains:
             (display_name, NSE folder path)
@@ -393,6 +398,7 @@ class DownloaderService:
                     visited = set()
 
                     root_started = time.monotonic()
+                    only_files = (file_filter or {}).get(root_path)
                     root_matching_before = result["matching_files"]
                     root_seen_before = result["total_files_seen"]
 
@@ -506,6 +512,13 @@ class DownloaderService:
 
                             elif item_type == "file":
                                 files_in_folder.append(item)
+
+                        if only_files is not None:
+                            child_folders = []
+                            files_in_folder = [
+                                item for item in files_in_folder
+                                if item["name"].strip() in only_files
+                            ]
 
                         result["total_files_seen"] += len(
                             files_in_folder
@@ -730,6 +743,7 @@ class DownloaderService:
                 files_failed=result["failed_files"],
                 folders_failed=len(result["failed_folders"]),
                 error_message="Stopped by user.",
+                failed_folders=result["failed_folders"],
             )
 
             log.warning(
@@ -752,6 +766,7 @@ class DownloaderService:
                 files_failed=result["failed_files"],
                 folders_failed=len(result["failed_folders"]),
                 error_message=f"{type(exc).__name__}: {exc}",
+                failed_folders=result["failed_folders"],
             )
             raise
 
@@ -782,6 +797,7 @@ class DownloaderService:
                 )
                 if failed_folders else None
             ),
+            failed_folders=failed_folders,
         )
 
         log.log(
@@ -900,6 +916,67 @@ class DownloaderService:
             exchange_date=date,
             mode=mode,
         )
+
+    def retry_run(self, run_id: int) -> dict:
+        """
+        Try again only what failed in an earlier run, as a new run:
+        its failed folders are walked again (with their subfolders) and
+        its failed files are fetched from their folders. Files that were
+        downloaded are not touched.
+        """
+
+        run = self.history.get_run(run_id)
+
+        if run is None:
+            raise LookupError(f"Run #{run_id} was not found.")
+
+        if run["status"] == "running":
+            raise ValueError(f"Run #{run_id} is still running.")
+
+        if not run.get("exchange_date"):
+            raise ValueError(f"Run #{run_id} has no exchange date to retry.")
+
+        folders = list(dict.fromkeys(self.history.failed_folder_paths(run)))
+
+        # A folder inside another failed folder is covered by walking that one.
+        folders = [
+            path for path in folders
+            if not any(other != path and path.startswith(other) for other in folders)
+        ]
+
+        file_filter: dict[str, set[str]] = {}
+
+        for folder_path, file_name in self.history.failed_files(run_id):
+            if any(folder_path.startswith(folder) for folder in folders):
+                continue
+            file_filter.setdefault(folder_path, set()).add(file_name)
+
+        if not folders and not file_filter:
+            raise ValueError(
+                f"Run #{run_id} has nothing left to retry "
+                "(no failed folders or files are recorded for it)."
+            )
+
+        selected = [(path.strip("/") or "/", path) for path in folders] + [
+            (f"{path.strip('/') or '/'}: {len(names)} file(s)", path)
+            for path, names in file_filter.items()
+        ]
+
+        log.info(
+            "Retrying run #%s (%s %s): %s folder(s), %s file(s).",
+            run_id, run["segment"], run["exchange_date"], len(folders),
+            sum(len(names) for names in file_filter.values()),
+        )
+
+        result = self._process_paths(
+            segment=run["segment"],
+            selected_paths=selected,
+            exchange_date=run["exchange_date"],
+            mode="retry",
+            file_filter=file_filter,
+        )
+        result["retry_of"] = run_id
+        return result
 
     def download_file(
         self,

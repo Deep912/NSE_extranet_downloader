@@ -1,5 +1,5 @@
-
 import json
+import re
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -101,8 +101,14 @@ class DownloadHistory:
         files_failed: int = 0,
         folders_failed: int = 0,
         error_message: str | None = None,
+        failed_folders: list[dict] | None = None,
     ) -> None:
         """Store the final counts and status of a run."""
+
+        failed_json = json.dumps([
+            {"folder_path": item.get("folder_path", ""), "error": item.get("error", "")}
+            for item in failed_folders
+        ]) if failed_folders else None
 
         with self._connect() as conn:
             conn.execute(
@@ -115,7 +121,8 @@ class DownloadHistory:
                     files_skipped = ?,
                     files_failed = ?,
                     folders_failed = ?,
-                    error_message = ?
+                    error_message = ?,
+                    failed_folders = ?
                 WHERE id = ?
                 """,
                 (
@@ -127,9 +134,62 @@ class DownloadHistory:
                     files_failed,
                     folders_failed,
                     error_message,
+                    failed_json,
                     run_id,
                 ),
             )
+
+    def get_run(self, run_id: int) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM download_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+
+        return dict(row) if row else None
+
+    def failed_files(self, run_id: int) -> list[tuple[str, str]]:
+        """(folder_path, file_name) of files whose latest attempt, in this run, failed."""
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT folder_path, file_name FROM downloads
+                WHERE run_id = ? AND status = 'failed'
+                ORDER BY folder_path, file_name
+                """,
+                (run_id,),
+            ).fetchall()
+
+        return [(row["folder_path"], row["file_name"]) for row in rows]
+
+    @staticmethod
+    def failed_folder_paths(run: dict) -> list[str]:
+        """
+        Folder paths (internal form, "" = root) that failed in a run.
+
+        Older runs only have the summary "3 folder(s) failed: Accounts/;
+        Onlinebackup/" in error_message, so that is read as a fallback.
+        """
+
+        raw = run.get("failed_folders")
+
+        if raw:
+            try:
+                return [
+                    str(item.get("folder_path") or "")
+                    for item in json.loads(raw)
+                    if isinstance(item, dict)
+                ]
+            except ValueError:
+                pass
+
+        match = re.match(r"\d+ folder\(s\) failed: (.*)$", run.get("error_message") or "")
+
+        if not match:
+            return []
+
+        paths = [part.strip() for part in match.group(1).split("; ") if part.strip()]
+        return ["" if path == "/" else path for path in paths]
 
     def get_recorded_files(
         self,
