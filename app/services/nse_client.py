@@ -17,6 +17,13 @@ class NSEExtranetClient:
 
     SUCCESS_CODE = "601"
 
+    # NSE tokens expire after 60 minutes and cannot be refreshed: sign in
+    # again a little before that, and once more if NSE rejects the token
+    # (802 invalid / 803 expired, e.g. after another login with the same
+    # API user, since only the latest token is valid).
+    TOKEN_REFRESH_SECONDS = 55 * 60
+    TOKEN_REJECTED_CODES = {"802", "803"}
+
     def __init__(self):
         if not settings.nse_credentials_configured:
             raise NSEAPIError(
@@ -29,6 +36,7 @@ class NSEExtranetClient:
         self.login_id = settings.nse_login_id
 
         self._token: str | None = None
+        self._token_obtained = 0.0  # time.monotonic() of the last login
 
         self._http = httpx.Client(
             base_url=self.base_url,
@@ -139,11 +147,19 @@ class NSEExtranetClient:
             )
 
         self._token = token
+        self._token_obtained = time.monotonic()
         log.info("Signed in to NSE %s.", settings.nse_environment)
         return token
 
     def _ensure_authenticated(self) -> None:
         """Login only when this client does not already have a token."""
+
+        if self._token and (
+            time.monotonic() - getattr(self, "_token_obtained", 0.0)
+            >= self.TOKEN_REFRESH_SECONDS
+        ):
+            log.info("NSE token is about to expire (60-minute limit). Signing in again.")
+            self._token = None
 
         if not self._token:
             self.login()
@@ -256,7 +272,54 @@ class NSEExtranetClient:
 
         return None
 
+    def _token_rejected(self, response: httpx.Response) -> str | None:
+        """NSE's code when it refused our token (802/803), else None."""
+
+        if response.status_code not in (401, 403) and "json" not in response.headers.get("content-type", ""):
+            return None
+
+        try:
+            payload = response.json()
+        except ValueError:
+            return "HTTP 401" if response.status_code == 401 else None
+
+        codes = self._codes(payload) if isinstance(payload, dict) else []
+
+        for code in codes:
+            if code in self.TOKEN_REJECTED_CODES:
+                return code
+
+        return "HTTP 401" if response.status_code == 401 and not codes else None
+
     def _get_with_retry(
+        self,
+        endpoint: str,
+        params: dict,
+        headers: dict,
+        description: str,
+    ) -> httpx.Response:
+        """
+        Send a GET request with retries. If NSE rejects the token (expired
+        or replaced), sign in again once and repeat the request.
+        """
+
+        response = self._send_with_retries(endpoint, params, headers, description)
+        rejected = self._token_rejected(response)
+
+        if rejected is None:
+            return response
+
+        log.warning(
+            "NSE rejected the sign-in token (%s) for %s. Signing in again.",
+            rejected, description,
+        )
+
+        self._token = None
+        headers = {**headers, **self._auth_headers()}  # signs in
+
+        return self._send_with_retries(endpoint, params, headers, description)
+
+    def _send_with_retries(
         self,
         endpoint: str,
         params: dict,
